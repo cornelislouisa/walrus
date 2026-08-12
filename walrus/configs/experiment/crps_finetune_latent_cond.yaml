@@ -1,0 +1,39 @@
+# @package _global_
+# CRPS finetune from a deterministic Walrus checkpoint using latent noise + ConditionalRMSGroupNorm.
+auto_resume: True
+finetune: True
+partial_load_weights: True
+folder_override: ""
+checkpoint_override: ""
+config_override: ""
+validation_mode: False
+frozen_components:
+  - model
+trainer:
+  loss_fn:
+    _target_: walrus.metrics.crps.CRPS
+  enable_staged_learning: True
+  common_params_warmup_epochs: 5
+  validation_ensemble_size: 16
+  max_num_samples: 8
+model:
+  _target_: walrus.models.IsotropicModelWithNoise
+  num_samples: 4
+  noise_type: "latent"
+  noise_mode: "global"
+  mlp_layers: 2
+  noise_layernorm: True
+  noise_dim: 32
+  noise_blocks: [0, 1, 2, 3, 4, 5, 6, 7]
+  processor:
+    noise_cond_dim: 0
+    norm_cond_dim: ${model.noise_dim}
+  processor_norm_layer:
+    _partial_: true
+    _target_: walrus.models.shared_utils.normalization.ConditionalRMSGroupNorm
+    conditioning_dim: ${model.processor.norm_cond_dim}
+data:
+  field_index_map_override:
+    closed_boundary: 0
+    open_boundary: 1
+    bias_correction: 2

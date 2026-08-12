@@ -1,0 +1,25 @@
+defaults:
+  - encoder: spacebag_and_vstride_encoder
+  - decoder: vstride_decoder
+  - processor: space_time_split
+  - norm_layer: rmsgroupnorm
+_target_: walrus.models.IsotropicModelWithNoise
+hidden_dim: 768
+projection_dim: 96
+intermediate_dim: 192
+processor_blocks: 12
+drop_path: .05
+groups: 12
+max_d: 3
+causal_in_time: False
+include_d: [2, 3]
+override_dimensionality: 3
+jitter_patches: True
+gradient_checkpointing_freq: 0
+num_samples: 4
+noise_type: latent
+noise_dim: 32
+noise_mode: global
+mlp_layers: 2
+noise_layernorm: True
+noise_blocks: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]

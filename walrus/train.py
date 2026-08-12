@@ -16,6 +16,7 @@ from walrus.data.well_to_multi_transformer import (
 )
 from walrus.optim.optim_utils import (
     build_param_groups,
+    setup_crps_optimizer_and_scheduler,
 )
 from walrus.trainer.checkpoints import CheckPointLoader
 from walrus.trainer.training import Trainer
@@ -27,6 +28,7 @@ from walrus.utils.experiment_utils import (
     align_checkpoint_with_field_to_index_map,
     configure_experiment,
 )
+from walrus.utils.utils import has_additional_params, load_common_weights
 
 logger = logging.getLogger("walrus")
 # logger.setLevel(level=logging.DEBUG)
@@ -48,8 +50,13 @@ def load_from_coalesced_checkpoint(
     field_to_index_map: Dict,
     old_field_index_map: Optional[Dict] = None,
     align_fields: bool = True,
+    partial_load: bool = False,
 ):
-    """Load model weights from a coalesced checkpoint, aligning field indices if necessary."""
+    """Load model weights from a coalesced checkpoint, aligning field indices if necessary.
+
+    When ``partial_load`` is True (CRPS finetuning with new stochastic layers), only
+    matching weights are loaded and a model_info dict is returned for staged optimizers.
+    """
     logger.info(f"Loading coalesced checkpoint {coalesced_checkpoint_path}")
     checkpoint = torch.load(coalesced_checkpoint_path, map_location="cpu")
     # Load the model weights
@@ -64,8 +71,13 @@ def load_from_coalesced_checkpoint(
             checkpoint_field_to_index_map=old_field_index_map,
             model_field_to_index_map=field_to_index_map,
         )
+    if partial_load:
+        model_info = load_common_weights(
+            model, model_checkpoint, strict=False, verbose=True
+        )
+        return model, model_info
     model.load_state_dict(model_checkpoint, strict=True)
-    return model
+    return model, None
 
 
 def train(
@@ -117,6 +129,16 @@ def train(
     #        2.1.1) If align_fields is true, use the new and old field to index maps to make sure the embedding layers are aligned correctly.
     # 3) If autoresume is set and standard path checkpointing logic shows a checkpoint to load from, load now (overrides previous loads)
     #    3.1) Note - autoresume assumes this is the same model structure as the checkpoint, so no field alignment is done here.
+    model_info = None
+    # Detect CRPS finetuning that introduces new architecture params (noise MLP / AdaLN / CondNorm)
+    finetuning_with_additional_params = any(
+        has_additional_params(getattr(cfg.model, part, {}))
+        for part in ("encoder", "processor", "decoder")
+    ) or (
+        hasattr(cfg.model, "noise_dim")
+        or cfg.get("partial_load_weights", False)
+    )
+
     load_coalesced_chkpt_cond = (
         hasattr(cfg.checkpoint, "coalesced_checkpoint_path")
         and cfg.checkpoint.coalesced_checkpoint_path is not None
@@ -125,12 +147,13 @@ def train(
     if load_coalesced_chkpt_cond and not cfg.checkpoint.get(
         "load_chkpt_after_finetuning_expansion", False
     ):
-        model = load_from_coalesced_checkpoint(
+        model, model_info = load_from_coalesced_checkpoint(
             model=model,
             coalesced_checkpoint_path=cfg.checkpoint.coalesced_checkpoint_path,
             field_to_index_map=field_to_index_map,
             old_field_index_map=old_field_index_map,
             align_fields=cfg.checkpoint.get("align_fields", True),
+            partial_load=finetuning_with_additional_params,
         )
     # Finetuning changes - technically useable without FT too
     if hasattr(cfg, "finetuning_mods"):
@@ -140,13 +163,16 @@ def train(
     if load_coalesced_chkpt_cond and cfg.checkpoint.get(
         "load_chkpt_after_finetuning_expansion", False
     ):
-        model = load_from_coalesced_checkpoint(
+        model, loaded_info = load_from_coalesced_checkpoint(
             model=model,
             coalesced_checkpoint_path=cfg.checkpoint.coalesced_checkpoint_path,
             field_to_index_map=field_to_index_map,
             old_field_index_map=old_field_index_map,
             align_fields=cfg.checkpoint.get("align_fields", True),
+            partial_load=finetuning_with_additional_params,
         )
+        if model_info is None:
+            model_info = loaded_info
     if rank == 0:
         summary(model, depth=5)
 
@@ -162,43 +188,60 @@ def train(
     model = model.to(device)
     model = distribute_model(model, cfg, device_mesh)
 
-    logger.info(f"Instantiate optimizer {cfg.optimizer._target_}")
-    if hasattr(cfg.optimizer, "param_groups"):
-        with open_dict(cfg):
-            param_groups_cfg = OmegaConf.to_container(
-                cfg.optimizer.pop("param_groups"), resolve=True
-            )
-    else:
-        param_groups_cfg = None
-
-    # Param group cfg only exists if we want different learning rates for different parts of the model
-    if param_groups_cfg is not None:
-        param_groups = build_param_groups(model, param_groups_cfg=param_groups_cfg)
-        optimizer = cast(
-            torch.optim.Optimizer,
-            instantiate(
-                cfg.optimizer,
-                params=param_groups,
-                lr=cfg.optimizer.lr,
-                _convert_="all",
-            ),
-        )
-    # Otherwise just instantiate normally
-    else:
-        optimizer = cast(
-            torch.optim.Optimizer,
-            instantiate(
-                cfg.optimizer,
-                params=model.parameters(),
-                lr=cfg.optimizer.lr,
-                _convert_="all",
-            ),
-        )
     # Set start epoch to 1 before potential retrieval from checkpoint
     # honestly forget why this is 1 and not 0, might have just been aesthetics in the loop printout
     start_epoch = 1
     last_epoch = -1  # Default for Pytorch
     val_loss = torch.tensor(float("inf"))
+    param_groups_cfg = None
+
+    # CRPS path: split new vs common params (and optional staged LR). Otherwise keep public path.
+    use_crps_optim = finetuning_with_additional_params or cfg.optimizer.get(
+        "new_params_lr", None
+    ) is not None
+    if use_crps_optim:
+        logger.info("Using CRPS staged optimizer / parameter groups")
+        optimizer, lr_scheduler = setup_crps_optimizer_and_scheduler(
+            cfg=cfg,
+            model=model,
+            model_info=model_info,
+            last_epoch=last_epoch,
+        )
+    else:
+        logger.info(f"Instantiate optimizer {cfg.optimizer._target_}")
+        if hasattr(cfg.optimizer, "param_groups"):
+            with open_dict(cfg):
+                param_groups_cfg = OmegaConf.to_container(
+                    cfg.optimizer.pop("param_groups"), resolve=True
+                )
+        else:
+            param_groups_cfg = None
+
+        # Param group cfg only exists if we want different learning rates for different parts of the model
+        if param_groups_cfg is not None:
+            param_groups = build_param_groups(model, param_groups_cfg=param_groups_cfg)
+            optimizer = cast(
+                torch.optim.Optimizer,
+                instantiate(
+                    cfg.optimizer,
+                    params=param_groups,
+                    lr=cfg.optimizer.lr,
+                    _convert_="all",
+                ),
+            )
+        # Otherwise just instantiate normally
+        else:
+            optimizer = cast(
+                torch.optim.Optimizer,
+                instantiate(
+                    cfg.optimizer,
+                    params=model.parameters(),
+                    lr=cfg.optimizer.lr,
+                    _convert_="all",
+                ),
+            )
+        lr_scheduler = None
+
     # Checkpointer manages standard path checkpoint loading/saving - step 3 in the above logic
     logger.info(f"Instantiate checkpointer {cfg.checkpoint._target_}")
     checkpointer: CheckPointLoader = instantiate(cfg.checkpoint, rank=rank)
@@ -244,28 +287,62 @@ def train(
                 last_epoch = (
                     start_epoch - 1
                 )  # Set last_epoch to the last completed epoch
-    if hasattr(cfg, "lr_scheduler"):
-        # Instantiate LR scheduler
-        logger.info(f"Instantiate learning rate scheduler {cfg.lr_scheduler._target_}")
-        # Option to convert from per-epoch scheduler to per-step scheduler
+
+    # LR scheduler for the standard (non-CRPS) path is created after resume so last_epoch is correct.
+    # CRPS path already built its scheduler in setup_crps_optimizer_and_scheduler (fresh FT starts at epoch 0).
+    if not use_crps_optim:
+        if hasattr(cfg, "lr_scheduler"):
+            logger.info(
+                f"Instantiate learning rate scheduler {cfg.lr_scheduler._target_}"
+            )
+            if cfg.trainer.lr_scheduler_per_step:
+                step_mult_factor = (
+                    cfg.data.module_parameters.max_samples / cfg.trainer.grad_acc_steps
+                )
+            else:
+                step_mult_factor = 1
+
+            lr_scheduler = instantiate(
+                cfg.lr_scheduler,
+                optimizer=optimizer,
+                max_epochs=cfg.trainer.max_epoch,
+                step_mult_factor=step_mult_factor,
+                last_epoch=max(-1, last_epoch - 1),
+            )
+        else:
+            logger.info("No learning rate scheduler")
+            lr_scheduler = None
+    elif last_epoch > 0 and hasattr(cfg, "lr_scheduler"):
+        # Rebuild only the CRPS scheduler against the resumed optimizer
+        from walrus.optim.optim_utils import create_crps_parameter_groups
+        from walrus.optim.staged_lr_scheduler import StagedLRScheduler
+
         if cfg.trainer.lr_scheduler_per_step:
-            # NOTE(TM): This ideally should be max_iterations or something. Or T_max if we are to go with pytorch.
             step_mult_factor = (
                 cfg.data.module_parameters.max_samples / cfg.trainer.grad_acc_steps
             )
         else:
             step_mult_factor = 1
-
-        lr_scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = instantiate(
+        main_lr_scheduler = instantiate(
             cfg.lr_scheduler,
             optimizer=optimizer,
             max_epochs=cfg.trainer.max_epoch,
             step_mult_factor=step_mult_factor,
             last_epoch=max(-1, last_epoch - 1),
         )
-    else:
-        logger.info("No learning rate scheduler")
-        lr_scheduler = None
+        enable_staged = getattr(cfg.trainer, "enable_staged_learning", False)
+        _, has_common = create_crps_parameter_groups(
+            model, model_info, new_params_lr=cfg.optimizer.lr
+        )
+        if has_common and enable_staged:
+            lr_scheduler = StagedLRScheduler(
+                optimizer=optimizer,
+                main_scheduler=main_lr_scheduler,
+                warmup_epochs=getattr(cfg.trainer, "common_params_warmup_epochs", 5),
+                last_epoch=max(-1, last_epoch - 1),
+            )
+        else:
+            lr_scheduler = main_lr_scheduler
 
     # Update the config with the newly generated field-to-index map for resuming/knowing what was there
     with open_dict(cfg):

@@ -5,10 +5,11 @@ except ImportError:
     DPOTWrapper = None
     ScOTWrapper = None
     MPPWrapper = None
-from .isotropic_model import IsotropicModel
+from .isotropic_model import IsotropicModel, IsotropicModelWithNoise
 
 __all__ = [
     "IsotropicModel",
+    "IsotropicModelWithNoise",
     "DPOTWrapper",
     "ScOTWrapper",
 ]

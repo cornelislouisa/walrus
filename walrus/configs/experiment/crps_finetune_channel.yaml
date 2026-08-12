@@ -1,0 +1,25 @@
+# @package _global_
+# CRPS finetune using an extra Gaussian noise input channel (no new AdaLN layers).
+auto_resume: True
+finetune: True
+folder_override: ""
+checkpoint_override: ""
+config_override: ""
+validation_mode: False
+frozen_components:
+  - model
+trainer:
+  loss_fn:
+    _target_: walrus.metrics.crps.CRPS
+  validation_ensemble_size: 16
+  max_num_samples: 8
+model:
+  _target_: walrus.models.IsotropicModelWithNoise
+  num_samples: 4
+  noise_type: "channel"
+data:
+  field_index_map_override:
+    closed_boundary: 0
+    open_boundary: 1
+    bias_correction: 2
+    noise: 3

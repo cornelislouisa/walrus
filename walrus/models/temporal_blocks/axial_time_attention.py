@@ -5,10 +5,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+from einops.layers.torch import Rearrange
 from timm.layers import DropPath
 from torch.nn import init
 
-from ..shared_utils.normalization import RMSGroupNorm
+from ..shared_utils.normalization import ConditionalRMSGroupNorm, RMSGroupNorm
 from ..shared_utils.position_biases import (
     RelativePositionBias,
     RotaryEmbedding,
@@ -27,10 +28,26 @@ class AxialTimeAttention(nn.Module):
         gradient_checkpointing=False,
         causal_in_time=False,
         norm_layer=RMSGroupNorm,
+        noise_cond_dim: int = 0,
+        norm_cond_dim: int = 0,
     ):
         super().__init__()
         self.num_heads = num_heads
-        self.norm1 = norm_layer(num_heads, hidden_dim, affine=True)
+        self.norm_cond_dim = norm_cond_dim if norm_cond_dim is not None else 0
+        if self.norm_cond_dim != 0:
+            assert (
+                norm_layer.func is ConditionalRMSGroupNorm
+            ), "If norm_cond_dim is specified, norm_layer must be ConditionalRMSGroupNorm"
+
+        norm1_kwargs = {
+            "num_groups": num_heads,
+            "num_channels": hidden_dim,
+            "affine": True,
+        }
+        if self.norm_cond_dim != 0:
+            norm1_kwargs["conditioning_dim"] = self.norm_cond_dim
+        self.norm1 = norm_layer(**norm1_kwargs)
+
         self.input_head = nn.Conv3d(hidden_dim, 3 * hidden_dim, 1)
         self.output_head = nn.Conv3d(hidden_dim, hidden_dim, 1)
 
@@ -58,6 +75,18 @@ class AxialTimeAttention(nn.Module):
             )
 
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        if noise_cond_dim != 0:
+            assert (
+                self.norm_cond_dim == 0
+            ), "Should not use both AdaLN and conditional norm"
+            self.ada_zero = nn.Sequential(
+                nn.Linear(noise_cond_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, 3 * hidden_dim),
+                Rearrange("... (n C) -> n ... C", n=3),
+            )
+
+            self.ada_zero[-2].weight.data.mul_(1e-2)
 
     def get_rotary_embedding(self, n, device):
         # if self.pos_emb is not None and self.pos_emb.shape[-2] >= n:
@@ -74,12 +103,31 @@ class AxialTimeAttention(nn.Module):
         if hasattr(self, "rotary_emb"):
             self.rotary_emb.make_learnable(per_axis)
 
-    def forward(self, x, return_att=False):
+    def forward(self, x, return_att=False, cond=None):
         # input is t x b x c x h x w
         T, B, C, H, W, D = x.shape
+
+        if cond is not None and hasattr(self, "ada_zero"):
+            a, b, c = self.ada_zero(cond)
+            a = rearrange(a, "t b c -> (t b) c")
+            b = rearrange(b, "t b c -> (t b) c")
+
+            a = a.view(T * B, C, 1, 1, 1)
+            b = b.view(T * B, C, 1, 1, 1)
+            c = c.view(T, B, C, 1, 1, 1)
+        else:
+            a, b, c = 0.0, 0.0, 0.0
+
         input = x.clone()
         x = rearrange(x, "t b c h w d -> (t b) c h w d")
-        x = self.norm1(x)
+        norm1_args = [x]
+        norm1_kwargs = {}
+        if self.norm_cond_dim != 0 and cond is not None:
+            norm1_kwargs["cond"] = cond
+        x = self.norm1(*norm1_args, **norm1_kwargs)
+
+        x = (a + 1) * x + b
+
         x = self.input_head(x)
         x = rearrange(
             x, "(t b) (he c) h w d ->  (b h w d) he t c", t=T, he=self.num_heads
@@ -111,7 +159,9 @@ class AxialTimeAttention(nn.Module):
         x = rearrange(x, "(b h w d) he t c -> (t b) (he c) h w d", h=H, w=W, d=D)
         x = self.output_head(x)
         x = rearrange(x, "(t b) c h w d-> t b c h w d", t=T)
-        output = self.drop_path(x) + input
+
+        output = self.drop_path((1 + c) * x) + input
+
         if return_att:
             return output, [att, rel_pos_bias]
         return output, []

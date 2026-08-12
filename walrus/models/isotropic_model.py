@@ -71,6 +71,10 @@ class IsotropicModel(nn.Module):
         ] = 0,  # Temporary due to FSDP resume issue
         dim_key_override: Optional[int] = None,  # Temporary due to FSDP resume issue
         norm_layer: Callable = RMSGroupNorm,
+        encoder_norm_layer: Optional[Callable] = None,
+        processor_norm_layer: Optional[Callable] = None,
+        decoder_norm_layer: Optional[Callable] = None,
+        num_samples: int = 1,
         *args,
         **kwargs,
     ):
@@ -107,6 +111,7 @@ class IsotropicModel(nn.Module):
                 max_d=self.max_d,
                 jitter_patches=jitter_patches,
             )
+        self.num_samples = num_samples
         self.embed = nn.ModuleDict(
             {
                 str(i): encoder(
@@ -115,12 +120,27 @@ class IsotropicModel(nn.Module):
                     inner_dim=intermediate_dim,
                     output_dim=hidden_dim,
                     groups=groups,
-                    norm_layer=norm_layer,
+                    norm_layer=(
+                        encoder_norm_layer
+                        if encoder_norm_layer is not None
+                        else norm_layer
+                    ),
                 )
                 for i in range(1, self.max_d + 1)
                 if i in include_d
             }
         )
+
+        # Subclasses (e.g. IsotropicModelWithNoise) set self.noise_dim/self.noise_blocks
+        # before calling super().__init__ so that the processor blocks can be
+        # conditioned on a noise embedding in the appropriate blocks.
+        if hasattr(self, "noise_dim"):
+            noise_dim_block = [
+                self.noise_dim if i in self.noise_blocks else 0
+                for i in range(processor_blocks)
+            ]
+        else:
+            noise_dim_block = [0 for i in range(processor_blocks)]
 
         self.blocks = nn.ModuleList(
             [
@@ -133,7 +153,12 @@ class IsotropicModel(nn.Module):
                         if gradient_checkpointing_freq > 0
                         else False
                     ),
-                    norm_layer=norm_layer,
+                    norm_layer=(
+                        processor_norm_layer
+                        if processor_norm_layer is not None
+                        else norm_layer
+                    ),
+                    noise_cond_dim=noise_dim_block[i],
                 )
                 for i in range(processor_blocks)
             ]
@@ -146,7 +171,11 @@ class IsotropicModel(nn.Module):
                     output_dim=n_states,
                     spatial_dims=3,
                     groups=groups,
-                    norm_layer=norm_layer,
+                    norm_layer=(
+                        decoder_norm_layer
+                        if decoder_norm_layer is not None
+                        else norm_layer
+                    ),
                 )
                 for i in range(1, self.max_d + 1)
                 if i in include_d
@@ -177,6 +206,31 @@ class IsotropicModel(nn.Module):
         if "freeze" in ft_param_dict:
             raise NotImplementedError("Freezing not implemented yet")
 
+    def _create_ensemble(self, x, num_samples):
+        """Create an ensemble of samples by adding noise if model is IsotropicModelWithNoise."""
+        if type(self) is not IsotropicModelWithNoise:
+            return x
+
+        # x is of size (t, b, c, ...)
+        t, b, c = x.shape[:3]
+        spatial_shape = x.shape[3:]
+        # Repeat x along batch dimension num_samples times
+        x = x.unsqueeze(2)  # (T, B, 1, C, ...)
+        x = x.expand(
+            -1, -1, num_samples, -1, *spatial_shape
+        )  # (T, B, num_samples, C, ...)
+
+        # Collapse back into batch dimension for the forward pass
+        x = x.reshape(t, b * num_samples, c, *spatial_shape)
+        if self.noise_type == "channel":
+            # Generate noise tensor of shape (t, b * num_samples, 1, ...)
+            noise = torch.randn(
+                (t, b * num_samples, 1, *spatial_shape), device=x.device, dtype=x.dtype
+            )
+            # Concatenate noise channel to x along channel dimension
+            x = torch.cat([x, noise], dim=2)
+        return x
+
     def _encoder_forward(
         self,
         x,
@@ -186,7 +240,10 @@ class IsotropicModel(nn.Module):
         patch_size,
         dynamic_ks=None,
         encoder_dummy=None,
+        num_samples=None,
     ):
+        num_samples = num_samples if num_samples is not None else self.num_samples
+
         if self.override_dimensionality > 0:
             n_spatial_dims = metadata.n_spatial_dims
         else:
@@ -196,6 +253,10 @@ class IsotropicModel(nn.Module):
         else:
             dim_key = str(self.dim_key_override)
         T, B = x.shape[:2]
+
+        # Create an ensemble by appending noise (no-op unless model is IsotropicModelWithNoise)
+        x = self._create_ensemble(x, num_samples)
+
         # Project into higher dim
         x = rearrange(
             x, "t b c h ... -> b c (t h) ..."
@@ -276,6 +337,8 @@ class IsotropicModel(nn.Module):
         proj_axes=None,
         return_att=False,
         train=True,
+        num_samples=None,
+        cond_noise=None,
     ):
         # x - T B C H [W D]
         # state_labels - C
@@ -285,6 +348,8 @@ class IsotropicModel(nn.Module):
         metadata = replace(metadata, n_spatial_dims=self.max_d)
         n_spatial_dims = metadata.n_spatial_dims
         dim_key = str(n_spatial_dims)
+        # Use provided value or fall back to instance default
+        num_samples = num_samples if num_samples is not None else self.num_samples
         # Pad to max dims so we can just use 3D convs - same flops, but empirically would be faster
         # to dynamically adjust which conv is used, but more verbose for compiler-friendly version
         x, squeeze_out = dim_pad(x, self.max_d)
@@ -334,6 +399,38 @@ class IsotropicModel(nn.Module):
         # constant downsampling as with hmlp
         else:
             patch_size = [self.embed[dim_key].patch_size] * self.max_d
+
+        # We either pass some noise into the model (created outside of the model)
+        # or create one inside the model
+        if cond_noise is None:
+            # For stochastic models with latent noise, create noise tensor
+            if (
+                hasattr(self, "noise_type")
+                and self.noise_type == "latent"
+                and self.noise_dim is not None
+            ):
+                if self.noise_mode == "global":
+                    cond_noise = torch.randn(
+                        (T, B * num_samples, self.noise_dim),
+                        device=x.device,
+                        dtype=x.dtype,
+                    )
+                    cond_noise = self.noise_mlp(cond_noise)
+                elif self.noise_mode == "spatial":
+                    cond_noise = None  # We will create this after we get the shape from the encoder
+                else:
+                    raise ValueError(
+                        f"Invalid noise mode {self.noise_mode}, choices are ['global', 'spatial']"
+                    )
+            else:
+                cond_noise = None
+        else:
+            assert (
+                self.noise_mode != "spatial"
+            ), "For spatial noise we need to get the spatial dimensions from the encoder."
+            if self.noise_mode == "global":
+                cond_noise = self.noise_mlp(cond_noise)
+
         # Always assume we need to checkpoint the encoder if any checkpointing is on
         if self.gradient_checkpointing_freq > 0:
             x, stage_info, jitter_info = torch.utils.checkpoint.checkpoint(
@@ -345,6 +442,7 @@ class IsotropicModel(nn.Module):
                 patch_size,
                 dynamic_ks,
                 self.encoder_dummy,
+                num_samples=num_samples,
                 use_reentrant=False,
             )
         else:
@@ -356,7 +454,27 @@ class IsotropicModel(nn.Module):
                 patch_size,
                 dynamic_ks,
                 self.encoder_dummy,
+                num_samples=num_samples,
             )
+
+        # For spatial noise we only inject the noise in the processor
+        # and create it after we get the output shape of the encoder
+        if (
+            hasattr(self, "noise_type")
+            and self.noise_type == "latent"
+            and self.noise_dim is not None
+            and self.noise_mode == "spatial"
+        ):
+            cond_noise = torch.randn(
+                (T, B * num_samples, self.noise_dim, *x.shape[3:]),
+                device=x.device,
+                dtype=x.dtype,
+            )
+            # Move channels to last dim
+            cond_noise = cond_noise.movedim(2, -1)
+            cond_noise = self.noise_mlp(cond_noise)
+            # Bring channels back
+            cond_noise = cond_noise.movedim(-1, 2)
 
         # Process
         all_att_maps = []
@@ -383,7 +501,11 @@ class IsotropicModel(nn.Module):
                     shifts=roll_quantities,
                     dims=periodic_dims,
                 )
-            x, att_maps = blk(x, bcs, return_att=return_att)
+            if hasattr(self, "noise_blocks") and ii in self.noise_blocks:
+                cond_noise_block = cond_noise
+            else:
+                cond_noise_block = None
+            x, att_maps = blk(x, bcs, return_att=return_att, cond=cond_noise_block)
             all_att_maps += att_maps
         # If we randomly rolled, we need to roll back
         if sum(roll_total) > 0 and self.jitter_patches:
@@ -428,5 +550,66 @@ class IsotropicModel(nn.Module):
         # De-inflate the extra channels if they were added:
         for _ in range(squeeze_out):
             x = x.squeeze(-1)
-        # Return T, B, C, H, [W], [D]
+        # Return T, (num_samples,) B, C, H, [W], [D]
         return x  # TODO - Return attention maps for debugging
+
+
+class IsotropicModelWithNoise(IsotropicModel):
+    """
+    IsotropicModel variant that supports CRPS-style stochastic ensembles.
+
+    Draws `num_samples` stochastic realizations per input by either concatenating
+    a noise channel to the input (`noise_type="channel"`) or by conditioning the
+    processor blocks on a learned noise embedding (`noise_type="latent"`).
+    """
+
+    def __init__(
+        self,
+        *args,
+        num_samples: int = 4,
+        noise_field_idx: int = 0,
+        noise_type: str = "channel",
+        noise_dim: int = 64,
+        noise_mode: str = "global",
+        mlp_layers: int = 0,
+        noise_layernorm: bool = True,
+        noise_blocks: list = [],
+        **kwargs,
+    ):
+        # These need to be set before super().__init__ so that IsotropicModel can
+        # size the processor blocks' noise conditioning dimension appropriately.
+        self.noise_dim = noise_dim
+        self.noise_blocks = noise_blocks
+        if noise_blocks == []:
+            assert (
+                "processor_blocks" in kwargs
+            ), "Must specify processor_blocks if noise_blocks not specified"
+            self.noise_blocks = list(range(kwargs["processor_blocks"]))
+        super().__init__(*args, num_samples=num_samples, **kwargs)
+        assert (
+            num_samples > 1
+        ), "Number of samples must be greater than 1 for model with stochasticity"
+        assert noise_type in [
+            "channel",
+            "latent",
+        ], "Invalid noise type, choices are ['channel', 'latent']"
+        self.noise_type = noise_type
+        self.noise_mlp = nn.Identity()
+        if noise_type == "latent":
+            self.noise_field_idx = None
+            self.noise_dim = noise_dim
+            self.noise_mode = noise_mode
+            if mlp_layers > 0:
+                self.noise_mlp = nn.Sequential(
+                    nn.Linear(self.noise_dim, 4 * self.noise_dim),
+                    nn.SiLU(),
+                    nn.Linear(4 * self.noise_dim, self.noise_dim),
+                    nn.LayerNorm(self.noise_dim) if noise_layernorm else nn.Identity(),
+                )
+            else:
+                self.noise_mlp = nn.Linear(self.noise_dim, self.noise_dim)
+        elif noise_type == "channel":
+            self.noise_field_idx = noise_field_idx
+            self.noise_dim = None
+        else:
+            raise ValueError("Invalid noise type, choices are ['channel', 'latent']")

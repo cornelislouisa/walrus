@@ -55,16 +55,18 @@ class RMSGroupNorm(nn.Module):
         >>> output = m(input)
     """
 
-    __constants__ = ["num_groups", "num_channels", "eps", "affine"]
+    __constants__ = ["num_groups", "num_channels", "conditioning_dim", "eps", "affine"]
     num_groups: int
     num_channels: int
     eps: float
+    conditioning_dim: int
     affine: bool
 
     def __init__(
         self,
         num_groups: int,
         num_channels: int,
+        conditioning_dim: int = 0,  # Unused, for compatibility with ConditionalRMSGroupNorm
         eps: float = 1e-6,
         affine: bool = True,
         device=None,
@@ -77,6 +79,7 @@ class RMSGroupNorm(nn.Module):
 
         self.num_groups = num_groups
         self.num_channels = num_channels
+        self.conditioning_dim = conditioning_dim
         self.eps = eps
         self.affine = affine
         if self.affine:
@@ -106,4 +109,81 @@ class RMSGroupNorm(nn.Module):
     def extra_repr(self) -> str:
         return "{num_groups}, {num_channels}, eps={eps}, affine={affine}".format(
             **self.__dict__
+        )
+
+
+class ConditionalRMSGroupNorm(nn.Module):
+    r"""Conditional RMS Group Normalization where affine parameters are
+    modulated by a conditioning tensor.
+    """
+
+    __constants__ = ["num_groups", "num_channels", "eps", "conditioning_dim", "affine"]
+    num_groups: int
+    num_channels: int
+    eps: float
+    conditioning_dim: int
+    affine: bool
+
+    def __init__(
+        self,
+        num_groups: int,
+        num_channels: int,
+        conditioning_dim: int,
+        eps: float = 1e-6,
+        affine: bool = True,
+        device=None,
+        dtype=None,
+    ) -> None:
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        if num_channels % num_groups != 0:
+            raise ValueError("num_channels must be divisible by num_groups")
+
+        self.num_groups = num_groups
+        self.num_channels = num_channels
+        self.conditioning_dim = conditioning_dim
+        self.eps = eps
+
+        self.conditioning_net = nn.Linear(
+            conditioning_dim, 2 * num_channels, **factory_kwargs
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.zeros_(self.conditioning_net.weight)
+        with torch.no_grad():
+            self.conditioning_net.bias[: self.num_channels].fill_(1.0)
+            self.conditioning_net.bias[self.num_channels :].fill_(0.0)
+
+    def forward(self, input: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        if input.dim() < 3:
+            raise ValueError(f"x must have at least 3 dims, got {input.shape}")
+
+        T, B = cond.shape[:2]
+        if cond.dim() > 3:
+            cond = cond.movedim(2, -1)
+        cond = cond.view(T * B, *cond.shape[2:])
+
+        conditioning_out = self.conditioning_net(cond)
+        scale, shift = conditioning_out.chunk(2, dim=-1)
+        scale = scale.movedim(-1, 1)
+        shift = shift.movedim(-1, 1)
+
+        dims = list(input.shape[2:])
+        normalized = input.view(input.shape[0], self.num_groups, -1, *dims)
+        norm_shape = normalized.shape[3:]
+        normalized = F.rms_norm(normalized, normalized_shape=norm_shape)
+        normalized = normalized.view(input.shape[0], -1, *dims)
+
+        if scale.shape != normalized.shape:
+            indexing_tuple = (slice(None), slice(None)) + (None,) * len(dims)
+            scale = scale[indexing_tuple]
+            shift = shift[indexing_tuple]
+
+        return normalized * scale + shift
+
+    def extra_repr(self) -> str:
+        return (
+            "{num_groups}, {num_channels}, conditioning_dim={conditioning_dim}, "
+            "eps={eps}".format(**self.__dict__)
         )

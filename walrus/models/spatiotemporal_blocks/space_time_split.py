@@ -1,5 +1,5 @@
 from functools import partial
-from typing import Callable
+from typing import Callable, Optional
 
 import torch.nn as nn
 from einops import rearrange
@@ -27,6 +27,8 @@ class SpaceTimeSplitBlock(nn.Module):
         gradient_checkpointing=False,
         causal_in_time=False,
         norm_layer: Callable = RMSGroupNorm,
+        noise_cond_dim: Optional[int] = 0,
+        norm_cond_dim: Optional[int] = 0,
     ):
         super().__init__()
         self.gradient_checkpointing = gradient_checkpointing
@@ -35,6 +37,8 @@ class SpaceTimeSplitBlock(nn.Module):
             drop_path=drop_path,
             gradient_checkpointing=gradient_checkpointing,
             norm_layer=norm_layer,
+            noise_cond_dim=noise_cond_dim,
+            norm_cond_dim=norm_cond_dim,
         )
         self.time_mixing = time_mixing(
             hidden_dim=hidden_dim,
@@ -42,6 +46,8 @@ class SpaceTimeSplitBlock(nn.Module):
             gradient_checkpointing=gradient_checkpointing,
             causal_in_time=causal_in_time,
             norm_layer=norm_layer,
+            noise_cond_dim=noise_cond_dim,
+            norm_cond_dim=norm_cond_dim,
         )
         self.channel_mixing = channel_mixing(hidden_dim=hidden_dim)
         self.causal_in_time = causal_in_time
@@ -53,24 +59,35 @@ class SpaceTimeSplitBlock(nn.Module):
         self.time_mixing.make_rope_learnable(per_axis)
         self.space_mixing.make_rope_learnable(per_axis)
 
-    def forward(self, x, bcs, return_att=False):
+    def forward(self, x, bcs, return_att=False, cond=None):
         # input is t x b x c x h x w
         T, B, C, H, W, D = x.shape
         if self.gradient_checkpointing:
             # kwargs seem to need to be passed explicitly
             wrapped_temporal = partial(self.time_mixing, return_att=return_att)
-            x, t_att = checkpoint(wrapped_temporal, x, use_reentrant=False)
+            x, t_att = checkpoint(wrapped_temporal, x, cond=cond, use_reentrant=False)
         else:
-            x, t_att = self.time_mixing(x, return_att=return_att)  # Residual in block
+            x, t_att = self.time_mixing(
+                x, return_att=return_att, cond=cond
+            )  # Residual in block
         # Temporal handles the rearrange so still is t x b x c x h x w
         x = rearrange(x, "t b c h w d -> (t b) c h w d")
         if self.gradient_checkpointing:
             # kwargs seem to need to be passed explicitly
             wrapped_spatial = partial(self.space_mixing, return_att=return_att)
-            x, s_att = checkpoint(wrapped_spatial, x, bcs, use_reentrant=False)
+            x, s_att = checkpoint(
+                wrapped_spatial,
+                x,
+                bcs,
+                cond=cond,
+                use_reentrant=False,
+            )
         else:
             x, s_att = self.space_mixing(
-                x, bcs, return_att=return_att
+                x,
+                bcs,
+                return_att=return_att,
+                cond=cond,
             )  # Convnext has the residual in the block
         x = rearrange(x, "(t b) c h w d -> t b c h w d", t=T)
         # MLP input is channels last - #TODO redefine as 1x1 conv to avoid reshape

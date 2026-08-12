@@ -6,6 +6,7 @@ import pickle
 import time
 from concurrent.futures import Future
 from contextlib import nullcontext
+from dataclasses import replace
 from random import shuffle
 from subprocess import CalledProcessError
 from typing import Any, Callable, Literal, Optional
@@ -28,6 +29,8 @@ from torch.distributed.fsdp.api import ShardingStrategy
 from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 from torch.utils.data import DataLoader
 
+from walrus.metrics.crps import CRPS, WeightedCRPS
+from walrus.models.isotropic_model import IsotropicModelWithNoise
 from walrus.trainer.checkpoints import CheckPointLoader
 from walrus.trainer.normalization_strat import (
     BaseRevNormalization,
@@ -160,6 +163,10 @@ class Trainer:
         minimum_context: int = 1,
         validation_full_trajectory_ensemble_size: int = 1,
         validation_one_step_ensemble_size: int = 1,
+        validation_ensemble_size: int = 1,
+        max_num_samples: int = 1000000,
+        enable_staged_learning: bool = False,  # stored but staging is handled in train.py
+        common_params_warmup_epochs: int = 5,
         masked_loss_for_objects: bool = True,
         video_validation: bool = False,
         video_size_multiplier: float = 0.4,
@@ -252,6 +259,17 @@ class Trainer:
             The number of times to repeat the trajectory during validation. The final prediction is averaged over all sampled trajectories.
         validation_one_step_ensemble_size:
             The number of samples to draw per step. The final step is averaged over all sampled steps.
+        validation_ensemble_size:
+            For stochastic (CRPS) models, the number of ensemble members to draw during validation.
+            Ignored for deterministic models.
+        max_num_samples:
+            Maximum number of ensemble members to materialize/compute a loss over at once. Reserved for
+            memory-efficient chunked generation/loss computation for stochastic models.
+        enable_staged_learning:
+            A boolean flag indicating staged learning is enabled. Staging itself is handled in train.py;
+            this is simply stored on the trainer for reference/logging.
+        common_params_warmup_epochs:
+            The number of epochs to warm up shared/common parameters when staged learning is enabled.
         video_validation:
             A boolean flag to enable saving rollouts to disk during validation
         dump_prediction_to_disk:
@@ -325,6 +343,29 @@ class Trainer:
             validation_full_trajectory_ensemble_size
         )
         self.validation_one_step_ensemble_size = validation_one_step_ensemble_size
+
+        # CRPS / stochastic setup
+        unwrapped = model.module if hasattr(model, "module") else model
+        self.is_deterministic = not isinstance(unwrapped, IsotropicModelWithNoise)
+        if not self.is_deterministic:
+            self.validation_ensemble_size = validation_ensemble_size
+            self.num_samples = getattr(unwrapped, "num_samples", 1)
+            self.max_num_samples = max_num_samples
+            # Ensure CRPS metrics are in validation suite
+            validation_metrics_names = [
+                m.__class__.__name__ for m in self.validation_suite
+            ]
+            if "CRPS" not in validation_metrics_names:
+                self.validation_suite.append(CRPS())
+            if "WeightedCRPS" not in validation_metrics_names:
+                self.validation_suite.append(WeightedCRPS())
+        else:
+            self.validation_ensemble_size = 1
+            self.num_samples = 1
+            self.max_num_samples = max_num_samples
+        self.enable_staged_learning = enable_staged_learning
+        self.common_params_warmup_epochs = common_params_warmup_epochs
+
         self.lr_scheduler_per_step = lr_scheduler_per_step
         self.debug_mode = debug_mode
         self.masked_loss_for_objects = masked_loss_for_objects
@@ -407,6 +448,15 @@ class Trainer:
             denormalize the output for loss calculation. If multiple steps used during training,
             throw error because not currently supported.
         """
+        # For stochastic (CRPS) models, num_samples comes from the model config during
+        # training and from validation_ensemble_size during validation. Deterministic
+        # models always use a fixed num_samples of 1 (set in __init__).
+        unwrapped_model = model.module if hasattr(model, "module") else model
+        if not self.is_deterministic:
+            if self.model.training:
+                self.num_samples = getattr(unwrapped_model, "num_samples", 1)
+            else:
+                self.num_samples = self.validation_ensemble_size
 
         metadata = batch["metadata"]
         batch = {
@@ -467,29 +517,80 @@ class Trainer:
             normalized_inputs[0] = self.revin.normalize_stdmean(
                 normalized_inputs[0], normalization_stats
             )
-            if train:
-                ensemble_size = 1  # No ensembling during training right now
+            if self.is_deterministic:
+                if train:
+                    ensemble_size = 1  # No ensembling during training right now
+                else:
+                    ensemble_size = self.validation_one_step_ensemble_size
+                for jj in range(ensemble_size):
+                    y_pred_internal = model(
+                        normalized_inputs[0],
+                        normalized_inputs[1],
+                        normalized_inputs[2].tolist(),
+                        metadata=metadata,
+                    )
+                    if jj == 0:
+                        y_pred = y_pred_internal.clone() / ensemble_size
+                    else:
+                        y_pred = y_pred + y_pred_internal / ensemble_size
+                # During validation, don't maintain full inner predictions
+                if not train and model.causal_in_time:
+                    y_pred = y_pred[-1:]  # y_pred is T first, y_ref is not
             else:
-                ensemble_size = self.validation_one_step_ensemble_size
-            for jj in range(ensemble_size):
-                y_pred_internal = model(
+                # CRPS / stochastic ensemble path. We only draw the ensemble (num_samples > 1)
+                # on the first rollout step - subsequent autoregressive steps propagate each
+                # already-drawn ensemble member independently (num_samples=1).
+                num_samples = self.num_samples if i == train_rollout_limit - 1 else 1
+                # Channel-noise models expect an extra noise channel concatenated to the
+                # input fields, which requires a matching extra entry in the state labels.
+                if getattr(unwrapped_model, "noise_field_idx", None) is not None:
+                    normalized_inputs[1] = torch.cat(
+                        [
+                            normalized_inputs[1],
+                            torch.tensor(
+                                unwrapped_model.noise_field_idx,
+                                device=normalized_inputs[1].device,
+                                dtype=normalized_inputs[1].dtype,
+                            ).unsqueeze(0),
+                        ],
+                        dim=0,
+                    )
+                y_pred = model(
                     normalized_inputs[0],
                     normalized_inputs[1],
                     normalized_inputs[2].tolist(),
                     metadata=metadata,
-                )
-                if jj == 0:
-                    y_pred = y_pred_internal.clone() / ensemble_size
-                else:
-                    y_pred = y_pred + y_pred_internal / ensemble_size
-            # During validation, don't maintain full inner predictions
-            if not train and model.causal_in_time:
-                y_pred = y_pred[-1:]  # y_pred is T first, y_ref is not
+                    num_samples=num_samples,
+                )  # [T, B*num_samples, C(+1 if channel noise), H, [W], [D]]
+                if getattr(unwrapped_model, "noise_field_idx", None) is not None:
+                    y_pred = y_pred[:, :, :-1]  # Strip the noise channel
+                # During validation, don't maintain full inner predictions
+                if not train and model.causal_in_time:
+                    y_pred = y_pred[-1:]  # y_pred is T first, y_ref is not
             # Train used normalized values to avoid precision loss
             # Validation on the other hand, reconstructs predictions on original scale
             if train:
                 pass  # Do nothing since we're computing loss on predicted value and normalizing "ref"
             elif self.prediction_type == "delta":
+                # On the step where the ensemble is created, expand normalization stats and
+                # the input context along the batch dim to match the new B*num_samples size.
+                # Important: use dataclasses.replace so we do NOT mutate shared GlobalRevNorm
+                # stats in-place (those are reused across validation batches).
+                if (
+                    not self.is_deterministic
+                    and i == train_rollout_limit - 1
+                    and num_samples > 1
+                ):
+                    normalization_stats = replace(
+                        normalization_stats,
+                        delta_std=normalization_stats.delta_std.repeat_interleave(
+                            num_samples, dim=1
+                        ),
+                        delta_mean=normalization_stats.delta_mean.repeat_interleave(
+                            num_samples, dim=1
+                        ),
+                    )
+                    inputs[0] = inputs[0].repeat_interleave(num_samples, dim=1)
                 # y_pred - (T_all or T=-1 depending on causal or not), B, C, H, [W, D]. Different from y_ref
                 with torch.autocast(
                     self.device.type, enabled=False, dtype=self.amp_type
@@ -500,6 +601,22 @@ class Trainer:
                         y_pred, normalization_stats
                     )  # Unnormalize delta and add to input
             elif self.prediction_type == "full":
+                # On the step where the ensemble is created, expand normalization stats along
+                # the batch dim to match the new B*num_samples size.
+                if (
+                    not self.is_deterministic
+                    and i == train_rollout_limit - 1
+                    and num_samples > 1
+                ):
+                    normalization_stats = replace(
+                        normalization_stats,
+                        sample_std=normalization_stats.sample_std.repeat_interleave(
+                            num_samples, dim=1
+                        ),
+                        sample_mean=normalization_stats.sample_mean.repeat_interleave(
+                            num_samples, dim=1
+                        ),
+                    )
                 y_pred = self.revin.denormalize_stdmean(y_pred, normalization_stats)
             else:
                 raise ValueError(
@@ -530,9 +647,23 @@ class Trainer:
             # normalization stats at each step, but also want to compute training loss
             # on normalized values
             if i != rollout_steps - 1:
-                moving_batch["input_fields"] = torch.cat(
-                    [moving_batch["input_fields"][:, 1:], y_pred[:, -1:]], dim=1
-                )
+                # For stochastic models, the batch dim gets expanded from B to B*num_samples
+                # the first time the ensemble is drawn - repeat the moving context to match.
+                if moving_batch["input_fields"].shape[0] != y_pred.shape[0]:
+                    repeats = y_pred.shape[0] // moving_batch["input_fields"].shape[0]
+                    moving_batch["input_fields"] = torch.cat(
+                        [
+                            moving_batch["input_fields"][:, 1:].repeat_interleave(
+                                repeats, dim=0
+                            ),
+                            y_pred[:, -1:],
+                        ],
+                        dim=1,
+                    )
+                else:
+                    moving_batch["input_fields"] = torch.cat(
+                        [moving_batch["input_fields"][:, 1:], y_pred[:, -1:]], dim=1
+                    )
             # For causal models, we get use full predictions for the first batch and
             # incremental predictions for subsequent batches - concat 1:T to y_ref for loss eval
             if model.causal_in_time and i == train_rollout_limit - 1:
@@ -560,6 +691,20 @@ class Trainer:
 
         del moving_batch, batch, mask  # Free up batch memory when done
         return y_pred_out, y_ref
+
+    def _expand_ensemble_preds(self, y_pred, y_ref):
+        """If num_samples>1, reshape y_pred [B*N,T,...] -> [B,N,T,...] and expand y_ref.
+
+        For deterministic models (or validation_ensemble_size/num_samples == 1), this is a
+        no-op and the tensors are returned unchanged.
+        """
+        if self.num_samples <= 1:
+            return y_pred, y_ref
+        B = y_pred.shape[0] // self.num_samples
+        remaining = y_pred.shape[1:]
+        y_pred = y_pred.contiguous().view((B, self.num_samples) + remaining)
+        y_ref = y_ref.unsqueeze(1).expand((B, self.num_samples) + y_ref.shape[1:])
+        return y_pred, y_ref
 
     def temporal_split_losses(
         self, loss_values, temporal_loss_intervals, loss_name, dset_name, fname="full"
@@ -715,6 +860,9 @@ class Trainer:
                                 y_pred_internal
                                 / self.validation_full_trajectory_ensemble_size
                             )
+                    # For stochastic models, reshape [B*N, T, ...] -> [B, N, T, ...] and expand
+                    # y_ref to match. No-op for deterministic models.
+                    y_pred, y_ref = self._expand_ensemble_preds(y_pred, y_ref)
                     assert y_ref.shape == y_pred.shape, (
                         f"Mismatching shapes between reference {y_ref.shape} and prediction {y_pred.shape}"
                     )
@@ -731,6 +879,15 @@ class Trainer:
                         y_pred[..., batch["padded_field_mask"]],
                         y_ref[..., batch["padded_field_mask"]],
                     )
+                    # For stochastic models, videos/plots/dumps/trajectory metrics are done on
+                    # the ensemble mean since they expect a single [B, T, ...] trajectory rather
+                    # than [B, N, T, ...].
+                    if not self.is_deterministic:
+                        y_pred_viz = y_pred.mean(dim=1)
+                        y_ref_viz = y_ref.mean(dim=1)
+                    else:
+                        y_pred_viz = y_pred
+                        y_ref_viz = y_ref
 
                     # Collecting names to make detailed output logs
                     used_field_names = [
@@ -748,9 +905,27 @@ class Trainer:
                         ):
                             continue
                         # Loss fn expect B T [H W D] C where [H W D] are described by metadata
-                        loss = loss_fn(
-                            y_pred, y_ref, current_metadata, eps=self.validation_epsilon
-                        )
+                        if not self.is_deterministic and (
+                            "CRPS" in loss_fn.__class__.__name__
+                        ):
+                            # CRPS/WeightedCRPS operate directly on the ensemble tensors
+                            # [B, N, T, ...] and don't take an `eps` kwarg.
+                            mem_efficient = self.num_samples > self.max_num_samples
+                            loss = loss_fn(
+                                y_pred, y_ref, current_metadata, mem_efficient=mem_efficient
+                            )
+                        elif not self.is_deterministic:
+                            # Point-wise metrics (e.g. VRMSE) are evaluated on the ensemble mean.
+                            loss = loss_fn(
+                                y_pred.mean(dim=1),
+                                y_ref.mean(dim=1),
+                                current_metadata,
+                                eps=self.validation_epsilon,
+                            )
+                        else:
+                            loss = loss_fn(
+                                y_pred, y_ref, current_metadata, eps=self.validation_epsilon
+                            )
                         # Some losses return multiple values for efficiency, so if not dict,
                         # wrap in dict here
                         if not isinstance(loss, dict):
@@ -789,7 +964,7 @@ class Trainer:
                     if dataset.full_trajectory_mode:
                         for traj_loss_fn in self.validation_trajectory_metrics or []:
                             traj_loss = traj_loss_fn(
-                                y_pred, y_ref, current_metadata, batch["metadata"]
+                                y_pred_viz, y_ref_viz, current_metadata, batch["metadata"]
                             )
                             if not isinstance(traj_loss, dict):
                                 traj_loss = {traj_loss_fn.__class__.__name__: traj_loss}
@@ -825,8 +1000,8 @@ class Trainer:
                             if self.video_validation and count < self.num_detailed_logs:
                                 try:
                                     make_video(
-                                        y_pred[0],  # First sample only in batch
-                                        y_ref[0],  # First sample only in batch
+                                        y_pred_viz[0],  # First sample only in batch
+                                        y_ref_viz[0],  # First sample only in batch
                                         current_metadata,
                                         self.viz_folder,
                                         f"{epoch}_rank{self.rank}_{valid_or_test}_batch{j}",  # For the file name
@@ -852,14 +1027,14 @@ class Trainer:
                                         dump_path,
                                         f"yref_{dset_name}_{valid_or_test}_epoch{epoch}_rank{self.rank}_{j}.npy",
                                     ),
-                                    y_ref.cpu().numpy(),
+                                    y_ref_viz.cpu().numpy(),
                                 )
                                 np.save(
                                     os.path.join(
                                         dump_path,
                                         f"ypred_{dset_name}_{valid_or_test}_epoch{epoch}_rank{self.rank}_{j}.npy",
                                     ),
-                                    y_pred.cpu().numpy(),
+                                    y_pred_viz.cpu().numpy(),
                                 )
                                 logger.info(f"Wrote out npy dumps to {dump_path}")
                     # For most per-"epoch" validations, we only do a configurably short subset
@@ -878,8 +1053,8 @@ class Trainer:
                             ):
                                 continue
                             plot_fn(
-                                y_pred,
-                                y_ref,
+                                y_pred_viz,
+                                y_ref_viz,
                                 current_metadata,
                                 self.viz_folder,  # Temporary until we port over the resume logic
                                 f"{epoch}_rank{self.rank}_{valid_or_test}_batch{j}",  # For the file name
@@ -888,8 +1063,8 @@ class Trainer:
                         if self.video_validation:
                             try:
                                 make_video(
-                                    y_pred[0],  # First sample only in batch
-                                    y_ref[0],  # First sample only in batch
+                                    y_pred_viz[0],  # First sample only in batch
+                                    y_ref_viz[0],  # First sample only in batch
                                     current_metadata,
                                     self.viz_folder,
                                     f"{epoch}_rank{self.rank}_{valid_or_test}_batch{j}",  # For the file name
@@ -1079,13 +1254,20 @@ class Trainer:
                         y_ref = y_ref[:, self.minimum_context :]
                         y_pred = y_pred[:, self.minimum_context :]
                     forward_time = time.time() - batch_start - data_time
+                    # For stochastic models, reshape [B*N, T, ...] -> [B, N, T, ...] and expand
+                    # y_ref to match. No-op for deterministic models.
+                    y_pred, y_ref = self._expand_ensemble_preds(y_pred, y_ref)
                     assert y_ref.shape == y_pred.shape, (
                         f"Mismatching shapes between reference {y_ref.shape} and prediction {y_pred.shape}"
                     )
+                    # CRPS losses don't take an `eps` kwarg (unlike the_well point-wise metrics)
+                    loss_kwargs = {}
+                    if "CRPS" not in self.loss_fn.__class__.__name__:
+                        loss_kwargs["eps"] = self.model_epsilon
                     loss = (
                         self.loss_multiplier
                         * self.loss_fn(
-                            y_pred, y_ref, current_metadata, eps=self.model_epsilon
+                            y_pred, y_ref, current_metadata, **loss_kwargs
                         ).mean()
                         / grad_acc_steps
                     )

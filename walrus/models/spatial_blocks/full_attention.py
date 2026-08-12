@@ -4,12 +4,13 @@ from typing import Callable
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+from einops.layers.torch import Rearrange
 from timm.layers import DropPath
 from torch.nn import init
 
 # Replace with model path later
 from ..shared_utils.lr_rope_temporary import RotaryEmbedding, apply_rotary_emb
-from ..shared_utils.normalization import RMSGroupNorm
+from ..shared_utils.normalization import ConditionalRMSGroupNorm, RMSGroupNorm
 from ..shared_utils.position_biases import (
     RelativePositionBias,
 )
@@ -34,6 +35,8 @@ class FullAttention(nn.Module):
         weight_tied_axes=True,
         gradient_checkpointing=False,
         norm_layer: Callable = RMSGroupNorm,
+        noise_cond_dim: int = 0,
+        norm_cond_dim: int = 0,
     ):
         super().__init__()
         self.mlp_dim = mlp_dim or hidden_dim * 4
@@ -44,7 +47,21 @@ class FullAttention(nn.Module):
         self.num_heads = num_heads
         self.max_d = max_d
         self.weight_tied_axes = weight_tied_axes
-        self.norm1 = norm_layer(num_heads, hidden_dim, affine=True)
+        self.norm_cond_dim = norm_cond_dim if norm_cond_dim is not None else 0
+        if self.norm_cond_dim != 0:
+            assert (
+                norm_layer.func is ConditionalRMSGroupNorm
+            ), "If norm_cond_dim is specified, norm_layer must be ConditionalRMSGroupNorm"
+
+        norm1_kwargs = {
+            "num_groups": num_heads,
+            "num_channels": hidden_dim,
+            "affine": True,
+        }
+        if self.norm_cond_dim != 0:
+            norm1_kwargs["conditioning_dim"] = self.norm_cond_dim
+        self.norm1 = norm_layer(**norm1_kwargs)
+
         self.fused_dims = (
             self.mlp_dim,
             hidden_dim,
@@ -90,6 +107,15 @@ class FullAttention(nn.Module):
                 [RelativePositionBias(n_heads=num_heads) for _ in range(3)]
             )
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        if noise_cond_dim != 0:
+            self.ada_zero = nn.Sequential(
+                nn.Linear(noise_cond_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, 3 * hidden_dim),
+                Rearrange("... (n C) -> n ... C", n=3),
+            )
+
+            self.ada_zero[-2].weight.data.mul_(1e-2)
 
     def make_rope_learnable(self, per_axis=False):
         """
@@ -106,12 +132,31 @@ class FullAttention(nn.Module):
         # self.register_buffer("pos_emb", pos_emb, persistent=False)
         return pos_emb
 
-    def forward(self, x, bcs, return_att=False):
+    def forward(self, x, bcs, return_att=False, cond=None):
         # input is t x b x c x h x w
         B, C, H, W, D = x.shape
 
+        if cond is not None and hasattr(self, "ada_zero"):
+            a, b, c = self.ada_zero(cond)
+            a = rearrange(a, "t b c -> (t b) c")
+            b = rearrange(b, "t b c -> (t b) c")
+            c = rearrange(c, "t b c -> (t b) c")
+
+            view_shape = (B, C, 1, 1, 1)
+            a = a.view(view_shape)
+            b = b.view(view_shape)
+            c = c.view(view_shape)
+        else:
+            a, b, c = 0.0, 0.0, 0.0
+
         input = x.clone()
-        x = self.norm1(x)
+        norm1_args = [x]
+        norm1_kwargs = {}
+        if self.norm_cond_dim != 0 and cond is not None:
+            norm1_kwargs["cond"] = cond
+        x = self.norm1(*norm1_args, **norm1_kwargs)
+
+        x = (a + 1) * x + b
 
         fused_ff_qkv = rearrange(x, "b c h w d -> b h w d c")
         ff, q, k, v = self.fused_ff_qkv(fused_ff_qkv).split(self.fused_dims, dim=-1)
@@ -131,7 +176,9 @@ class FullAttention(nn.Module):
         att = F.scaled_dot_product_attention(q, k, v)
         att = rearrange(att, "b he (h w d) c -> b h w d (he c)", h=H, w=W)
         att_out = self.attn_out(att)
-        x = self.drop_path(att_out + self.ff_out(self.activation(ff)))
-        x = rearrange(x, "b h w d c -> b c h w d") + input
+        x = att_out + self.ff_out(self.activation(ff))
+        x = rearrange(x, "b h w d c -> b c h w d")
+
+        x = self.drop_path((1 + c) * x) + input
 
         return x, []
