@@ -222,16 +222,14 @@ class AdaptiveDVstrideDecoder(nn.Module):
                 padding[-i] = 0
             k = weight.shape[-i]  # Shape of the kernel in the given dim
             s = stride[-i]
-            pad_in = (
-                (k - s) // s
-            )  # TODO (mm) - This might get messed up for future non-divisible cases
-            pad_out = k - s
-            # if dist.get_rank() == 0:
-            #     print("wtf is going on", i, dim, bcs)
+            # Circular context for the transposed conv. Cropping `pad_in * s` from each
+            # side after the transpose restores exactly `(n-1)*s + k`, matching the
+            # encoder. The older `pad_out = k - s` only agrees with that when
+            # `(k - s) % s == 0`, which fails for odd strides like 3 (96-px axes).
+            pad_in = (k - s) // s
+            pad_out = pad_in * s
             # NOTE - if dim = 1, padding is already 0, but this is more explicit.
             if dim != 1 and int(bcs[-i][0]) == BoundaryCondition["PERIODIC"].value:
-                # if dist.get_rank() == 0:
-                #     print(dist.get_rank(), "periodic!", bcs, spatial_dims)
                 periodic_padding[2 * (i - 1)] = pad_in
                 periodic_padding[2 * (i - 1) + 1] = pad_in
                 padding_out[2 * (i - 1)] = -pad_out

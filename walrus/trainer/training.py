@@ -715,6 +715,15 @@ class Trainer:
         new_losses = {}
         # Average over time interval
         new_losses[f"{dset_name}/{fname}_{loss_name}_T=all"] = loss_values.mean(dim=1)
+        # Cumulative early-horizon VRMSE is useful for comparing models before long
+        # autoregressive rollouts saturate. This reuses the already-computed per-frame
+        # loss, so it does not perform any additional model rollouts.
+        if loss_name == "VRMSE":
+            for horizon in (10, 20):
+                if loss_values.shape[1] >= horizon:
+                    new_losses[
+                        f"{dset_name}/{fname}_{loss_name}_T=0:{horizon}"
+                    ] = loss_values[:, :horizon].mean(dim=1)
         # Don't compute sublosses if we only have one interval
         if len(temporal_loss_intervals) <= 2:
             return new_losses

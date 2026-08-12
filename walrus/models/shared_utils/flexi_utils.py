@@ -79,6 +79,8 @@ def choose_kernel_size_deterministic(
     patch_dict = {
         0: (1, 1),
         1: (1, 1),
+        2: (2, 1),
+        3: (3, 1),
         4: (2, 2),
         8: (4, 2),
         12: (6, 2),

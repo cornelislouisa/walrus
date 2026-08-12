@@ -25,6 +25,8 @@ datasets/viscoelastic_instability/data/
 
 datasets/rayleigh_benard/data/
 
+demo_notebooks/_analysis_viz/
+
 datasets/shear_flow/data/
 datasets/supernova_explosion_128/data/
 datasets/supernova_explosion_64/data/

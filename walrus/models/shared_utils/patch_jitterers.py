@@ -7,6 +7,24 @@ from einops import rearrange
 from the_well.data.datasets import BoundaryCondition
 
 
+def _tiling_deficit(
+    length: int,
+    padding: int,
+    base_kernel: Sequence[int],
+    stride: Sequence[int],
+) -> int:
+    """Extra padding needed for an axis of `length` to be tiled exactly by the two
+    strided encoder convolutions, so that the transposed convolutions in the decoder
+    reproduce the padded length.
+    """
+    kernel1, kernel2 = base_kernel
+    stride1, stride2 = stride
+    deficit = -(length + padding - kernel1) % stride1
+    tokens1 = (length + padding + deficit - kernel1) // stride1 + 1
+    # Each token the second conv is short of a full tile costs `stride1` input pixels.
+    return deficit + stride1 * (-(tokens1 - kernel2) % stride2)
+
+
 class PatchJitterer(nn.Module):
     """Applies random shifts to patches so that error doesn't accumulate in single patches
     For BCs that don't support periodicity, pads the patches with random values before shifting
@@ -240,6 +258,17 @@ class PatchJittererBoundaryPad(nn.Module):
                 axis_padding_with_extra: List[int] = [
                     (p + extra_padding) for p in jitter_padding
                 ]
+                if ("base_kernel" in kwargs) and ("random_kernel" in kwargs):
+                    # Halving the padding truncates when a stride is odd, leaving an
+                    # axis the strided convs cannot tile exactly, so the decoder
+                    # hands back fewer pixels than it was given. Grow the trailing
+                    # pad until both convs divide evenly; even strides are untouched.
+                    axis_padding_with_extra[1] += _tiling_deficit(
+                        shape[i],
+                        sum(axis_padding_with_extra),
+                        (base_kernel1, base_kernel2),
+                        (stride1, stride2),
+                    )
             # Pytorch padding goes [last[start], last[end], ..., first[start], first[end]] so we prepend
             if i >= n_dims or shape[i] == 1:
                 periodic_paddings = [0, 0] + periodic_paddings

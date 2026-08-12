@@ -7,7 +7,7 @@ include = ["walrus*"]
 
 [project]
 name = "walrus"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 version = "1.0.0"
 readme = "README.md"
 dependencies = [
@@ -25,7 +25,8 @@ dependencies = [
     "torchvision==0.20.1",
     "torchaudio==2.5.1",
     "torchinfo>=1.8.0,<2",
-    "wandb>=0.17.9"
+    "wandb>=0.17.9",
+    "ffmpeg>=1.4",
 ]
 
 
