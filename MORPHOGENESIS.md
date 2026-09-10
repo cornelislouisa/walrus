@@ -230,6 +230,42 @@ bash run_scripts/morphogenesis_finetune.sh \
 The script downloads the published Walrus checkpoint into `<repo>/checkpoints` unless
 `CHECKPOINT_PATH` and `CONFIG_PATH` point to local copies.
 
+### Hyperparameter sweep
+
+`run_scripts/morphogenesis_sweep.sh` wraps `morphogenesis_finetune.sh` and launches
+a small grid of deterministic Walrus finetunes in parallel, one trial per GPU.
+Each trial is the same pretrained WT recipe with a single Hydra override (or a
+pair, for context length plus learning rate). The built-in trials are:
+
+| Tag | Override |
+| --- | --- |
+| `lr5e-5` | `optimizer.lr=5e-5` |
+| `n_steps-10` | `data.module_parameters.n_steps_input=10` |
+| `n_steps-10-lr5e-5` | context 10 and `optimizer.lr=5e-5` |
+| `wd1e-3` | `optimizer.weight_decay=1e-3` |
+| `max_epoch-100` | `trainer.max_epoch=100` |
+
+They were chosen to probe rollout validation after the default 8-frame setup:
+lower learning rate or stronger weight decay against late overfitting, longer
+context, and a shorter training budget near where the 8-frame run peaked.
+
+Runs are named `Walrus_ft_morpho_<tag>` under `EXPERIMENT_DIR` (default
+`<repo>/runs/morphogenesis`). If that directory already has `checkpoints/best` or
+`checkpoints/last`, the script appends a timestamp instead of overwriting.
+Stdout and stderr go to `<run_dir>/train.log`. GPUs are taken in waves of
+`GPUS` (default `0 1 2 3`); the next wave starts only after the current wave
+finishes.
+
+```bash
+cd <repo>/walrus
+EXPERIMENT_DIR=/path/to/runs/morphogenesis \
+GPUS="0 1 2" \
+bash run_scripts/morphogenesis_sweep.sh
+```
+
+This is not the CRPS ablation launcher. That is
+`run_scripts/crps_finetune_latent_sweep.sh`.
+
 ### Walrus from scratch
 
 Use the same architecture and training settings while disabling the pretrained
