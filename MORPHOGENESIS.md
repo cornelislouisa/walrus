@@ -227,8 +227,28 @@ bash run_scripts/morphogenesis_finetune.sh \
   logger.wandb_project_name=morphogenesis_myosin
 ```
 
-The script downloads the published Walrus checkpoint into `<repo>/checkpoints` unless
-`CHECKPOINT_PATH` and `CONFIG_PATH` point to local copies.
+Finetuning starts from the published 1.3B Walrus weights on
+[Hugging Face (`polymathic-ai/walrus`)](https://huggingface.co/polymathic-ai/walrus).
+`morphogenesis_finetune.sh` looks for two files under `<repo>/checkpoints/`
+(that directory is gitignored):
+
+```text
+<repo>/checkpoints/walrus.pt
+<repo>/checkpoints/extended_config.yaml
+```
+
+If they are missing, the script downloads `walrus.pt` and `extended_config.yaml`
+from that Hub repo (`hf download` or `wget`). To use a copy you already have:
+
+```bash
+CHECKPOINT_PATH=/path/to/walrus.pt \
+CONFIG_PATH=/path/to/extended_config.yaml \
+bash run_scripts/morphogenesis_finetune.sh
+```
+
+`CHECKPOINT_DIR` changes the default folder for both files. `SKIP_DOWNLOAD=1`
+fails instead of fetching if they are absent. Scratch training does not use
+these weights.
 
 ### Hyperparameter sweep
 
