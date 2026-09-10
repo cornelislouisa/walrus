@@ -157,6 +157,13 @@ cd /home/louisa/code/the_well/scripts
 python compute_statistics.py /data/lcornelis/morphogenesis_data -n 4
 ```
 
+For a single dataset already laid out as `<root>/<name>/{data/train,valid,test}`,
+this clone also has `scripts/get_one_stats.py`:
+
+```bash
+python scripts/get_one_stats.py /data/lcornelis/morphogenesis_data/WT stats.yaml
+```
+
 Before training, verify that every configured dataset has non-empty `train`, `valid`,
 and `test` directories and that `stats.yaml` contains statistics for every predicted
 field. In particular, myosin datasets need both `velocity` and `myosin_tensor`
@@ -181,15 +188,23 @@ The Hydra data name is the YAML filename without `.yaml`:
 
 `morphogenesis_WT_old` and its bundled `WT_old_stats.yaml` exist only to reproduce
 the historical 128-by-128 run. The `repo://` normalization path is resolved against
-the clone root, so it is portable. This is not the current WT dataset. See
-`scripts/fix_wt_old_dataset_name.py` and `scripts/verify_wt_old_matches_run.py` before
-using that compatibility path.
+the clone root, so it is portable. This is not the current WT dataset. If HDF5
+`dataset_name` attributes need rewriting, dry-run then apply
+`scripts/fix_wt_old_dataset_name.py`. To check that a saved run still matches its
+logged validation scores:
+
+```bash
+python scripts/verify_wt_old_matches_run.py --run-dir /path/to/saved/run --epoch 50
+```
 
 ## 5. Train the models
 
 Run these commands from `<repo>/walrus`. Replace the experiment directory with a
 writable location. Hydra overrides appended to a script select another dataset,
-project, run name, or training length without editing the script.
+project, run name, or training length without editing the script. Existing
+launchers log to historically named W&B projects (`morphogenesis`,
+`morphogenesis_myosin`, `morphogenesis_no_myosin`); override
+`logger.wandb_project_name` if you want a different board.
 
 ### Pretrained Walrus finetuning
 

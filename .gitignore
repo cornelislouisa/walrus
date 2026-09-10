@@ -30,6 +30,7 @@ demo_notebooks/_analysis_cache/
 demo_notebooks/figures/
 _analysis_viz/
 _analysis_cache/
+_verify_viz/
 
 # Local model weights, run directories, and resolved Hydra configs
 checkpoints/

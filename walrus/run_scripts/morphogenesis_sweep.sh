@@ -1,14 +1,16 @@
 #!/bin/bash
-# Launch hyperparam ablations on free GPUs (machine has 0,1,2 — use 1 and 2).
+# Launch hyperparam ablations across GPUs.
 # Usage:
 #   bash walrus/run_scripts/morphogenesis_sweep.sh
+# Optional:
+#   GPUS="1 2" bash walrus/run_scripts/morphogenesis_sweep.sh
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 EXPERIMENT_DIR="${EXPERIMENT_DIR:-${REPO_ROOT}/runs/morphogenesis}"
-GPUS=(0 1 2 3)
+read -ra GPUS <<< "${GPUS:-0 1 2 3}"
 
 # tag|hydra_override  (space-separated overrides OK after the |)
 # Aimed at improving rollout_valid over n_steps=8:

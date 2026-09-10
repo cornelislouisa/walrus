@@ -52,9 +52,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--run-dir",
-        default="/scr/louisa/walrus/runs/morphogenesis/Walrus_ft_morpho_lr_scheduler-inv",
+        required=True,
+        help="saved morphogenesis run directory that contains extended_config.yaml",
     )
     parser.add_argument("--epoch", type=int, default=50)
+    parser.add_argument(
+        "--viz-dir",
+        type=pathlib.Path,
+        default=pathlib.Path("_verify_viz"),
+        help="directory for trainer visualization side-effects",
+    )
     args = parser.parse_args()
 
     run_dir = pathlib.Path(args.run_dir)
@@ -69,7 +76,7 @@ def main() -> None:
     print(f"stats     : {meta.get('normalization_path', 'stats.yaml (in data root)')}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    viz = pathlib.Path("./_verify_viz") / run_dir.name
+    viz = args.viz_dir / run_dir.name
     viz.mkdir(parents=True, exist_ok=True)
     trainer = build_trainer(cfg, ckpt, device, viz)
 

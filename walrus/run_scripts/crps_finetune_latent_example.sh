@@ -23,9 +23,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-# Default to GPU 1 (override with CUDA_VISIBLE_DEVICES=...).
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
-
 NGPUS="${NGPUS:-1}"
 EXPERIMENT_DIR="${EXPERIMENT_DIR:-${REPO_ROOT}/runs/morphogenesis_crps}"
 
@@ -77,7 +74,7 @@ done
 mkdir -p "${EXPERIMENT_DIR}"
 
 echo "CRPS starting from ${COALESCED_CKPT}"
-echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} NGPUS=${NGPUS}"
+echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset} NGPUS=${NGPUS}"
 
 torchrun \
   --standalone \
