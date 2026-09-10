@@ -5,6 +5,13 @@ except ImportError:
     DPOTWrapper = None
     ScOTWrapper = None
     MPPWrapper = None
+from walrus.baselines import (
+    AdvectionWrapper,
+    FFNOWrapper,
+    MeanFieldWrapper,
+    SineNetWrapper,
+)
+
 from .isotropic_model import IsotropicModel, IsotropicModelWithNoise
 
 __all__ = [
@@ -12,4 +19,9 @@ __all__ = [
     "IsotropicModelWithNoise",
     "DPOTWrapper",
     "ScOTWrapper",
+    "MPPWrapper",
+    "AdvectionWrapper",
+    "FFNOWrapper",
+    "MeanFieldWrapper",
+    "SineNetWrapper",
 ]

@@ -1,18 +1,21 @@
 #!/bin/bash -l
 
-# Local finetuning script for parka.
+# Legacy 3-frame-context finetuning recipe for the historical 128x128 WT data.
+# Current experiments should use morphogenesis_finetune.sh instead.
 # Usage:
-#   bash run_scripts/morphogenesis_finetune.sh
+#   bash run_scripts/morphogenesis_resume_orig.sh
 # Optional:
-#   NGPUS=2 bash run_scripts/morphogenesis_finetune.sh
-#   SKIP_DOWNLOAD=1 bash run_scripts/morphogenesis_finetune.sh
-#   CHECKPOINT_PATH=/path/to/walrus.pt bash run_scripts/morphogenesis_finetune.sh
+#   NGPUS=2 bash run_scripts/morphogenesis_resume_orig.sh
+#   CHECKPOINT_PATH=/path/to/walrus.pt bash run_scripts/morphogenesis_resume_orig.sh
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
 NGPUS="${NGPUS:-1}"
-EXPERIMENT_DIR="${EXPERIMENT_DIR:-/scratch/lcornelis/walrus/runs/morphogenesis}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-/home/lcornelis/code/walrus/checkpoints}"
+EXPERIMENT_DIR="${EXPERIMENT_DIR:-${REPO_ROOT}/runs/morphogenesis_legacy}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-${REPO_ROOT}/checkpoints}"
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-${CHECKPOINT_DIR}/walrus.pt}"
 CONFIG_PATH="${CONFIG_PATH:-${CHECKPOINT_DIR}/extended_config.yaml}"
 HF_REPO="polymathic-ai/walrus"
@@ -25,12 +28,10 @@ export TORCHELASTIC_ERROR_FILE=torch_worker_log.json
 export NCCL_DEBUG=WARN
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-source /home/lcornelis/anaconda3/etc/profile.d/conda.sh
-conda activate walrus
+source "${REPO_ROOT}/.venv/bin/activate"
 
-export PYTHONPATH="/home/lcornelis/code/walrus:${PYTHONPATH:-}"
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}/.."
 
 mkdir -p "${EXPERIMENT_DIR}" "${CHECKPOINT_DIR}"
@@ -124,7 +125,7 @@ torchrun \
   data.module_parameters.min_dt_stride=1 \
   data.module_parameters.max_dt_stride=1 \
   trainer.prediction_type="delta" \
-  data=morphogenesis \
+  data=morphogenesis_WT_old \
   trainer.max_epoch=100 \
   data_workers=10 \
   model.override_dimensionality=0 \
@@ -133,4 +134,5 @@ torchrun \
   ++trainer.skip_spectral_metrics=True \
   ++data.module_parameters.start_rollout_valid_output_at_t=-1 \
   ++experiment_dir="${EXPERIMENT_DIR}" \
-  "${CHECKPOINT_ARGS[@]}"
+  "${CHECKPOINT_ARGS[@]}" \
+  "$@"

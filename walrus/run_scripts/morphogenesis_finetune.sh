@@ -14,8 +14,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 NGPUS="${NGPUS:-1}"
-EXPERIMENT_DIR="${EXPERIMENT_DIR:-/scr/louisa/walrus/runs/morphogenesis}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-/home/louisa/code/walrus/checkpoints}"
+EXPERIMENT_DIR="${EXPERIMENT_DIR:-${REPO_ROOT}/runs/morphogenesis}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-${REPO_ROOT}/checkpoints}"
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-${CHECKPOINT_DIR}/walrus.pt}"
 CONFIG_PATH="${CONFIG_PATH:-${CHECKPOINT_DIR}/extended_config.yaml}"
 HF_REPO="polymathic-ai/walrus"
@@ -91,12 +91,12 @@ torchrun \
   distribution=local \
   server=local \
   model=isotropic_model \
-  name=Walrus_ft_morph_WT_myosin \
+  name=Walrus_ft_morph_WT_no_myosin \
   trainer=globalnorm \
   trainer.grad_acc_steps=1 \
   optimizer=adam \
   optimizer.lr=1.e-4 \
-  logger.wandb_project_name="morphogenesis_myosin" \
+  logger.wandb_project_name="morphogenesis_no_myosin" \
   trainer.enable_amp=False \
   model.gradient_checkpointing_freq=0 \
   trainer.log_interval=10 \
@@ -126,7 +126,7 @@ torchrun \
   data.module_parameters.min_dt_stride=1 \
   data.module_parameters.max_dt_stride=1 \
   trainer.prediction_type="delta" \
-  data=morphogenesis_WT_myosin \
+  data=morphogenesis_WT \
   trainer.max_epoch=200 \
   data_workers=10 \
   model.override_dimensionality=0 \

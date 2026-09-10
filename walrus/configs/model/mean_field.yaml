@@ -1,0 +1,9 @@
+_target_: walrus.baselines.mean_field.MeanFieldWrapper
+time_history: 10
+time_future: 1
+in_channels: 2
+out_channels: 2
+# EMA toward the running spatial mean of (normalized) training context frames.
+momentum: 0.05
+spatial: true
+use_all_context_frames: true

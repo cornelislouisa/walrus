@@ -1,0 +1,9 @@
+_target_: walrus.baselines.advection.AdvectionWrapper
+dt: 1.0
+n_steps: 1
+time_history: 10
+time_future: 1
+in_channels: 2
+out_channels: 2
+# Morph has mixed open/periodic BCs; border is a reasonable default.
+padding_mode: border

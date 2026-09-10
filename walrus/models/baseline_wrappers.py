@@ -7,6 +7,7 @@ transforms to match their expected formats.
 
 from collections import OrderedDict
 from functools import partial
+import os
 
 import torch
 import torch.nn as nn
@@ -23,6 +24,7 @@ from .external_models.mpp_avit import (
     SpaceTimeBlock,
 )
 from .external_models.scot import ScOT, ScOTConfig
+from walrus.baselines.utils import restore_inflated_spatial, squeeze_inflated_spatial
 
 
 def apply_checkpointing(module):
@@ -159,12 +161,19 @@ class ScOTWrapper(nn.Module):
             # **kwargs,
         )
         if len(from_pretrained) > 0:
-            if from_pretrained not in {"T", "B", "L"}:
+            # Hub shorthand ("T"/"B"/"L") or a local HuggingFace snapshot directory.
+            if from_pretrained in {"T", "B", "L"}:
+                pretrained_source = f"camlab-ethz/Poseidon-{from_pretrained}"
+            elif os.path.isdir(from_pretrained):
+                pretrained_source = from_pretrained
+            else:
                 raise ValueError(
-                    f"From pretrained value of {from_pretrained} not a valid poseidon model size. Use T, B, or L"
+                    f"from_pretrained={from_pretrained!r} must be 'T', 'B', 'L', "
+                    "or an existing local checkpoint directory "
+                    "(e.g. checkpoints/Poseidon-L)."
                 )
             self.inner_model = ScOT.from_pretrained(
-                f"camlab-ethz/Poseidon-{from_pretrained}",
+                pretrained_source,
                 config=config,
                 ignore_mismatched_sizes=True,
             )
@@ -195,16 +204,17 @@ class ScOTWrapper(nn.Module):
         return_att=False,
         train=True,
     ):
-        # Reshape inputs to match poseidon
-        # Well inputs - T x B x C x H x W x D
-        x = x[-1]  # eliminate singleton time dim
-        # RUN MODEL
+        # Well inputs are T B C H W [D]; inflated 2D data has a trailing singleton D.
+        x, n_squeezed = squeeze_inflated_spatial(x)
+        x = x[-1]  # ScOT is single-frame: (B, C, H, W)
+        n_c = self.inner_model.config.num_channels
+        x = x[:, :n_c]
         preds = self.inner_model(
             pixel_values=x,
             time=torch.tensor([0.05], device=x.device),  # dummy time conditioning
         ).output
-        preds = preds.unsqueeze(0)
-        return preds
+        preds = preds.unsqueeze(0)  # restore time axis -> (1, B, C, H, W)
+        return restore_inflated_spatial(preds, n_squeezed)
 
 
 class DPOTWrapper(nn.Module):

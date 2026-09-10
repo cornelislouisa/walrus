@@ -11,7 +11,8 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-EXPERIMENT_DIR="${EXPERIMENT_DIR:-/scr/louisa/walrus/runs/morphogenesis_crps_sweep}"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+EXPERIMENT_DIR="${EXPERIMENT_DIR:-${REPO_ROOT}/runs/morphogenesis_crps_sweep}"
 # Override with e.g. GPUS="1 2" if 0/3 are busy.
 read -ra GPUS <<< "${GPUS:-1 2 3}"
 

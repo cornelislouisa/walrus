@@ -4,3 +4,6 @@ folder_override: "" # Override the folder name for the experiment - considered "
 checkpoint_override: "" # Override search path for a resume checkpoint - considered "resume" if populated
 config_override: "" # Override the search path for a config file
 validation_mode: False
+# Required by experiment_utils even when not finetuning / resuming shapes.
+frozen_components:
+  - model

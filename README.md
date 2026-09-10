@@ -43,13 +43,19 @@ By default, this repository does not include all dependencies of non-Walrus mode
 instead run:
 
 ```bash
-pip install .[external_modes]
+pip install ".[external_models]"
 ```
 ## Running Experiments
 
 This project is orchestrated using [Hydra](https://github.com/facebookresearch/hydra) to give users modular access over 
 various model components, datasets, and runtime options. All training was done in slurm environments. Example invocations
 for training, validating, and finetuning Walrus models can be found in [walrus/run_scripts](walrus/run_scripts).
+
+This fork's WT, myosin, temperature, mutation, baseline, CRPS, and zero-shot
+morphogenesis workflow is documented separately in
+[MORPHOGENESIS.md](MORPHOGENESIS.md). It includes the required Well directory
+layout, training-split statistics generation, launch commands, analysis notebooks,
+cache behavior, and reproducibility checks.
 
 Most of these use relative paths and slurm. For example, one would launch the training script with:
 ```bash

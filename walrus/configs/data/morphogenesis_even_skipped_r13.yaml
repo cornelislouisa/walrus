@@ -1,7 +1,7 @@
 defaults:
 - field_index_map_override: bc_only_override
 well_base_path: /mnt/gpuxl/polymathic/the_well/datasets/
-wandb_data_name: morphogenesis
+wandb_data_name: morphogenesis_even_skipped_r13
 module_parameters:
   _target_: walrus.data.MixedWellDataModule
   batch_size: 8
@@ -14,4 +14,4 @@ module_parameters:
     morphodynamic_atlas:
       include_filters: []
       exclude_filters: []
-      path: /data/lcornelis/morphogenesis_data/even-skipped_r13
+      path: /data/lcornelis/morphogenesis_data/even_skipped_r13

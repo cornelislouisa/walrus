@@ -26,6 +26,24 @@ datasets/viscoelastic_instability/data/
 datasets/rayleigh_benard/data/
 
 demo_notebooks/_analysis_viz/
+demo_notebooks/_analysis_cache/
+demo_notebooks/figures/
+_analysis_viz/
+_analysis_cache/
+
+# Local model weights, run directories, and resolved Hydra configs
+checkpoints/
+runs/
+extended_config.yaml
+
+# Notebook and test tooling state
+.ipynb_checkpoints/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Generated experiment diagnostics and videos
+torch_worker_log*.json
 
 datasets/shear_flow/data/
 datasets/supernova_explosion_128/data/

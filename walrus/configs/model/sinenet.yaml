@@ -1,0 +1,22 @@
+_target_: walrus.baselines.sinenet.SineNetWrapper
+hidden_channels: 64
+num_waves: 2
+num_layers: 4
+num_blocks: 1
+mult: 2
+time_history: 10
+time_future: 1
+# Morphogenesis WT velocity is 2 channels (vx, vy).
+in_channels: 2
+out_channels: 2
+# Mixed open/periodic BCs on morph data — zeros is safer than global circular.
+padding_mode: zeros
+activation: gelu
+norm: true
+residual: true
+wave_residual: true
+disentangle: true
+down_pool: true
+avg_pool: true
+up_interpolation: true
+interpolation_mode: bicubic

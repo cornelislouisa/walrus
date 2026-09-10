@@ -20,6 +20,16 @@ from .utils import get_dict_depth
 logger = logging.getLogger(__name__)
 
 
+def _resolve_normalization_path(path: Optional[str]) -> Optional[str]:
+    """Resolve ``repo://`` paths against the repository root."""
+    if not isinstance(path, str) or not path.startswith("repo://"):
+        return path
+    repo_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+    return os.path.join(repo_root, path.removeprefix("repo://"))
+
+
 def update_field_names(metadata, field_name_transforms):
     scalar_names = [
         field_name_transforms.get(name, name) for name in metadata.scalar_names
@@ -227,6 +237,9 @@ class MixedWellDataset(Dataset):
             assert set(dataset_kws.keys()).issubset(set(well_dataset_info.keys())), (
                 f"Expected dataset_kws keys {dataset_kws.keys()} to be a subset of well_dataset_info keys {well_dataset_info.keys()}."
             )
+        # Kept because _build_subset_dict reopens the datasets and options like
+        # pad_cartesian_data_to_d change the field names it has to map.
+        self.dataset_kws = dataset_kws or {}
 
         for dataset_name, info in well_dataset_info.items():
             include_filters = info.get("include_filters", [])
@@ -244,7 +257,9 @@ class MixedWellDataset(Dataset):
             field_name_transforms = global_field_name_transforms | local_name_transforms
             dset_field_transforms = global_field_transforms | dset_field_transforms
             dataset_path = info.get("path", None)
-            normalization_path = info.get("normalization_path", None)
+            normalization_path = _resolve_normalization_path(
+                info.get("normalization_path", None)
+            )
 
             subdset = self.inner_dataset_type(
                 path=dataset_path,
@@ -320,6 +335,7 @@ class MixedWellDataset(Dataset):
                         well_dataset_name=dataset_name,
                         well_split_name=self.well_split_name,
                         use_normalization=False,  # Don't need normalization to get this data
+                        **self.dataset_kws.get(dataset_name, {}),
                     )
                 except Exception:
                     logger.warning(f"Failed to load {dataset_name} dataset")
@@ -346,6 +362,7 @@ class MixedWellDataset(Dataset):
                     path=dataset_path,
                     well_split_name=self.well_split_name,
                     use_normalization=False,
+                    **self.dataset_kws.get(dataset_name, {}),
                 )
             elif dataset_name in WELL_DATASETS:
                 temp_dset = self.inner_dataset_type(
@@ -353,6 +370,7 @@ class MixedWellDataset(Dataset):
                     well_dataset_name=dataset_name,
                     well_split_name=self.well_split_name,
                     use_normalization=False,  # Don't need normalization to get this data
+                    **self.dataset_kws.get(dataset_name, {}),
                 )
             else:
                 raise ValueError(

@@ -183,6 +183,7 @@ class Trainer:
         start_val_loss: Optional[float] = None,
         epsilon: float = 1e-5,
         validation_epsilon: float = 1e-5,
+        rollout_artifact_callback: Optional[Callable[..., None]] = None,
     ):
         """
         Class in charge of the training loop. It performs train, validation and test.
@@ -307,6 +308,7 @@ class Trainer:
         self.video_size_multiplier = video_size_multiplier
         self.dump_prediction_to_disk = dump_prediction_to_disk
         self.num_detailed_logs = num_detailed_logs
+        self.rollout_artifact_callback = rollout_artifact_callback
         self.gradient_log_level = gradient_log_level
         self.log_interval = log_interval
         self.device = device
@@ -528,6 +530,7 @@ class Trainer:
                         normalized_inputs[1],
                         normalized_inputs[2].tolist(),
                         metadata=metadata,
+                        train=train,
                     )
                     if jj == 0:
                         y_pred = y_pred_internal.clone() / ensemble_size
@@ -561,6 +564,7 @@ class Trainer:
                     normalized_inputs[2].tolist(),
                     metadata=metadata,
                     num_samples=num_samples,
+                    train=train,
                 )  # [T, B*num_samples, C(+1 if channel noise), H, [W], [D]]
                 if getattr(unwrapped_model, "noise_field_idx", None) is not None:
                     y_pred = y_pred[:, :, :-1]  # Strip the noise channel
@@ -581,15 +585,19 @@ class Trainer:
                     and i == train_rollout_limit - 1
                     and num_samples > 1
                 ):
-                    normalization_stats = replace(
-                        normalization_stats,
-                        delta_std=normalization_stats.delta_std.repeat_interleave(
-                            num_samples, dim=1
-                        ),
-                        delta_mean=normalization_stats.delta_mean.repeat_interleave(
-                            num_samples, dim=1
-                        ),
-                    )
+                    # Global stats are broadcast tensors with a batch dim of 1, which
+                    # already match any batch size - interleaving them would produce
+                    # num_samples rather than B*num_samples.
+                    if normalization_stats.delta_std.shape[1] != 1:
+                        normalization_stats = replace(
+                            normalization_stats,
+                            delta_std=normalization_stats.delta_std.repeat_interleave(
+                                num_samples, dim=1
+                            ),
+                            delta_mean=normalization_stats.delta_mean.repeat_interleave(
+                                num_samples, dim=1
+                            ),
+                        )
                     inputs[0] = inputs[0].repeat_interleave(num_samples, dim=1)
                 # y_pred - (T_all or T=-1 depending on causal or not), B, C, H, [W, D]. Different from y_ref
                 with torch.autocast(
@@ -607,6 +615,7 @@ class Trainer:
                     not self.is_deterministic
                     and i == train_rollout_limit - 1
                     and num_samples > 1
+                    and normalization_stats.sample_std.shape[1] != 1
                 ):
                     normalization_stats = replace(
                         normalization_stats,
@@ -904,6 +913,27 @@ class Trainer:
                         for i, f in enumerate(field_names)
                         if batch["padded_field_mask"][i]
                     ]
+                    # Analysis can persist the physical-unit rollout once and reuse it
+                    # for VRMSE tables, videos, distributions and flow metrics.
+                    if self.rollout_artifact_callback is not None:
+                        context = batch["input_fields"][
+                            ..., batch["padded_field_mask"]
+                        ]
+                        self.rollout_artifact_callback(
+                            dataset=dset_name,
+                            batch_index=j,
+                            pred=y_pred_viz.detach().float().cpu().numpy(),
+                            ref=y_ref_viz.detach().float().cpu().numpy(),
+                            context=context.detach().float().cpu().numpy(),
+                            input_time=batch["input_time_grid"].detach().cpu().numpy(),
+                            output_time=batch["output_time_grid"].detach().cpu().numpy(),
+                            space_grid=batch["space_grid"].detach().cpu().numpy(),
+                            field_names=used_field_names,
+                            metadata=current_metadata,
+                            file_paths=list(
+                                getattr(dataset, "files_paths", []) or []
+                            ),
+                        )
 
                     # Iterate through all validation metrics and log them.
                     for loss_fn in self.validation_suite:
@@ -1384,7 +1414,7 @@ class Trainer:
             String to indicate if we are validating or testing. Options are "valid" or "test"
         """
         is_test = valid_or_test == "test"  # Check if test
-        val_loss, rollout_val_loss = None, None
+        val_loss, checkpoint_metric = None, None
         # First do one step checks = frequency, last epoch, or test. Only do full validation on last epoch or test
         if epoch % self.val_frequency == 0 or epoch >= self.max_epoch or is_test:
             logger.info(
@@ -1426,14 +1456,27 @@ class Trainer:
                 f"rollout_{valid_or_test}": rollout_val_loss,
                 "epoch": epoch,
             }
+            # Same carry-forward pattern as one-step val_loss: only update when
+            # rollout validation runs. Used as the score for checkpoints/best.
+            metric_suffix = "/full_VRMSE_T=all_mean"
+            metric_prefix = f"rollout_{valid_or_test}_"
+            metric_values = [
+                float(v)
+                for k, v in rollout_val_loss_dict.items()
+                if k.startswith(metric_prefix) and k.endswith(metric_suffix)
+            ]
+            if metric_values:
+                checkpoint_metric = sum(metric_values) / len(metric_values)
             if self.wandb_logging and self.rank == 0:
                 wandb.log(rollout_val_loss_dict)
-        return val_loss, rollout_val_loss
+        return val_loss, checkpoint_metric
 
     def train(self):
         """Run training, validation and test. The training is run for multiple epochs."""
         checkpoint_future = None
-        val_loss = self.start_val_loss
+        # Carried across epochs like the old one-step val_loss: only refreshed
+        # when rollout validation runs (every rollout_val_frequency epochs).
+        checkpoint_metric = self.start_val_loss
         train_dataloader = self.datamodule.train_dataloader(self.sampling_rank)
         epoch = self.start_epoch
         for epoch in range(
@@ -1468,10 +1511,11 @@ class Trainer:
                 rank=self.rank_in_sync_group,
                 full=(epoch >= self.max_epoch and not self.debug_mode),
             )
-            maybe_val_loss, rollout_loss = self.validate_if_necessary(
+            _, maybe_checkpoint_metric = self.validate_if_necessary(
                 epoch, val_dataloders, rollout_val_dataloaders
             )
-            val_loss = maybe_val_loss if maybe_val_loss is not None else val_loss
+            if maybe_checkpoint_metric is not None:
+                checkpoint_metric = maybe_checkpoint_metric
             if checkpoint_future is not None:
                 logger.debug(
                     f"Wait for previous checkpointing {checkpoint_future} to complete."
@@ -1480,7 +1524,7 @@ class Trainer:
             # Save "last" every epoch plus various intervals/best results
             if not self.skip_checkpointing:
                 checkpoint_future = self.save_model_if_necessary(
-                    epoch, val_loss, last=(epoch == self.max_epoch)
+                    epoch, checkpoint_metric, last=(epoch == self.max_epoch)
                 )
         # Do test validation
         test_dataloaders = self.datamodule.test_dataloaders(

@@ -6,7 +6,8 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-EXPERIMENT_DIR="${EXPERIMENT_DIR:-/scr/louisa/walrus/runs/morphogenesis}"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+EXPERIMENT_DIR="${EXPERIMENT_DIR:-${REPO_ROOT}/runs/morphogenesis}"
 GPUS=(0 1 2 3)
 
 # tag|hydra_override  (space-separated overrides OK after the |)

@@ -1,17 +1,20 @@
 #!/bin/bash -l
 
-# CRPS-finetune the deterministically finetuned WT-myosin Walrus checkpoint
+# CRPS-finetune the deterministically finetuned WT (no-myosin) Walrus checkpoint
 # using latent noise + AdaLN conditioning.
 #
 # Starts from the best rollout_valid VRMSE checkpoint of:
-#   Walrus_ft_morph_WT_myosin-morph-delta-Isotr[Space-Adapt-]-AdamW-0.0001
-#   (wandb project morphogenesis_myosin) -> step_60, full_VRMSE_T=all_mean=0.879
+#   Walrus_ft_morph_WT_no_myosin-morph-delta-Isotr[Space-Adapt-]-AdamW-0.0001
+#   (wandb project morphogenesis_myosin)
+#   metric: rollout_valid_wt_sqh_mcherry_pivlab_velocity/full_VRMSE_T=all_mean
+#   -> step_50 (0.7956). Absolute best was epoch 65 (0.7947) but only every-10
+#      step_* checkpoints exist; `best/` is epoch 15 by one-step val_loss.
 #
 # Usage:
 #   bash run_scripts/crps_finetune_latent_example.sh
 # Optional:
 #   CUDA_VISIBLE_DEVICES=0 NGPUS=1 bash run_scripts/crps_finetune_latent_example.sh
-#   DET_RUN=/path/to/det/run CKPT_STEP=best bash run_scripts/crps_finetune_latent_example.sh
+#   DET_RUN=/path/to/det/run CKPT_STEP=step_50 bash run_scripts/crps_finetune_latent_example.sh
 #   NUM_SAMPLES=2 bash run_scripts/crps_finetune_latent_example.sh   # if you OOM
 #   EXPERIMENT=crps_finetune_latent_cond bash run_scripts/crps_finetune_latent_example.sh
 
@@ -24,25 +27,31 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 
 NGPUS="${NGPUS:-1}"
-EXPERIMENT_DIR="${EXPERIMENT_DIR:-/scr/louisa/walrus/runs/morphogenesis_myosin_crps}"
+EXPERIMENT_DIR="${EXPERIMENT_DIR:-${REPO_ROOT}/runs/morphogenesis_crps}"
 
-# Deterministic WT-myosin finetune run we are starting from.
-DET_RUN="${DET_RUN:-/scr/louisa/walrus/runs/morphogenesis/Walrus_ft_morph_WT_myosin-morph-delta-Isotr[Space-Adapt-]-AdamW-0.0001/finetune/3}"
-# Prefer best-by-rollout_valid VRMSE (epoch 60), not the one-step `best` symlink (epoch 200).
-CKPT_STEP="${CKPT_STEP:-step_60}"
+# Deterministic WT (no-myosin) finetune run we are starting from.
+DET_RUN="${DET_RUN:-}"
+if [[ -z "${DET_RUN}" ]]; then
+  echo "ERROR: set DET_RUN to a completed deterministic Walrus run directory."
+  exit 1
+fi
+# Prefer best-by-rollout_valid VRMSE among saved step_* (epoch 50), not the one-step
+# `best/` directory (epoch 15 by short val_loss).
+CKPT_STEP="${CKPT_STEP:-step_50}"
 COALESCED_CKPT="${COALESCED_CKPT:-${DET_RUN}/checkpoints/${CKPT_STEP}/full_checkpoint.pt}"
 CONFIG_OVERRIDE="${CONFIG_OVERRIDE:-${DET_RUN}/extended_config.yaml}"
 
-DATA_NAME="${DATA_NAME:-morphogenesis_WT_myosin}"
+DATA_NAME="${DATA_NAME:-morphogenesis_WT}"
 EXPERIMENT="${EXPERIMENT:-crps_finetune_latent}"
+RUN_NAME="${RUN_NAME:-Walrus_crps_morph_latent_noise-every-2}"
 
 # Ensemble size used for the CRPS training loss. Every member is a full forward
 # pass, so this multiplies activation memory.
 NUM_SAMPLES="${NUM_SAMPLES:-4}"
 VAL_ENSEMBLE="${VAL_ENSEMBLE:-4}"
-# Which processor blocks get noise conditioning. The det model has 40 blocks and
-# each conditioned block adds ~12M AdaLN params, so condition a strided subset.
-NOISE_BLOCKS="${NOISE_BLOCKS:-[0,5,10,15,20,25,30,35]}"
+# Condition every other processor block (noise-every-2). The det model has 40
+# blocks and each conditioned block adds ~12M AdaLN params.
+NOISE_BLOCKS="${NOISE_BLOCKS:-[0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30,32,34,36,38]}"
 
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 export HDF5_USE_FILE_LOCKING=FALSE
@@ -78,7 +87,7 @@ torchrun \
   experiment="${EXPERIMENT}" \
   server=local \
   distribution=local \
-  name=Walrus_crps_morph_WT_myosin_latent \
+  "name=${RUN_NAME}" \
   finetune=True \
   auto_resume=False \
   checkpoint=finetune \
@@ -94,7 +103,7 @@ torchrun \
   trainer.grad_acc_steps=1 \
   trainer.clip_gradient=10 \
   trainer.log_interval=10 \
-  trainer.max_epoch=50 \
+  trainer.max_epoch=100 \
   trainer.val_frequency=5 \
   trainer.rollout_val_frequency=5 \
   trainer.short_validation_length=20 \

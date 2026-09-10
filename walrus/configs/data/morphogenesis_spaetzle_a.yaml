@@ -1,7 +1,7 @@
 defaults:
 - field_index_map_override: bc_only_override
 well_base_path: /mnt/gpuxl/polymathic/the_well/datasets/
-wandb_data_name: gray_scott_reaction_diffusion
+wandb_data_name: morphogenesis_spaetzle_a
 module_parameters:
   _target_: walrus.data.MixedWellDataModule
   batch_size: 8
@@ -11,6 +11,7 @@ module_parameters:
   max_dt_stride: 1
   max_samples: 2000
   well_dataset_info:
-    gray_scott_reaction_diffusion:
+    morphodynamic_atlas:
       include_filters: []
       exclude_filters: []
+      path: /data/lcornelis/morphogenesis_data/spaetzle_a

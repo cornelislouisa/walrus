@@ -1,0 +1,24 @@
+_target_: walrus.baselines.ffno.FFNOWrapper
+modes: 16
+width: 64
+n_layers: 4
+time_history: 10
+time_future: 1
+# Morphogenesis WT velocity is 2 channels (vx, vy). Constants are sliced off
+# in the wrapper input / trainer output path.
+in_channels: 2
+out_channels: 2
+dropout: 0.0
+in_dropout: 0.0
+share_weight: false
+share_fork: false
+factor: 2
+ff_weight_norm: false
+n_ff_layers: 2
+layer_norm: false
+mode: full
+use_position: true
+use_fourier_position: false
+# Walrus Trainer already applies RevIN — keep FFNO's internal normalizer off.
+should_normalize: false
+noise_std: 0.0

@@ -1,8 +1,37 @@
+import os
+
 import pytest
 from the_well.data.augmentation import Resize
+from torch.utils.data import RandomSampler, SequentialSampler
 
 from walrus.data.multidatamodule import MixedWellDataModule
-from walrus.data.multidataset import MixedWellDataset
+from walrus.data.multidataset import MixedWellDataset, _resolve_normalization_path
+
+
+def test_repo_normalization_path_is_portable():
+    path = _resolve_normalization_path(
+        "repo://walrus/configs/data/WT_old_stats.yaml"
+    )
+    assert path is not None
+    assert path.endswith("walrus/configs/data/WT_old_stats.yaml")
+    assert os.path.isfile(path)
+
+
+def test_full_eval_loader_preserves_dataset_order():
+    """Full evaluation must align batch j with files_paths[j]."""
+    module = MixedWellDataModule.__new__(MixedWellDataModule)
+    module.world_size = 1
+    module.data_workers = 0
+
+    full_loader = module.build_loaders_from_dset_list(
+        [range(3)], batch_size=1, full=True
+    )[0]
+    partial_loader = module.build_loaders_from_dset_list(
+        [range(3)], batch_size=1, full=False
+    )[0]
+
+    assert isinstance(full_loader.sampler.sampler, SequentialSampler)
+    assert isinstance(partial_loader.sampler.sampler, RandomSampler)
 
 
 def test_datamodule(dummy_dataset):

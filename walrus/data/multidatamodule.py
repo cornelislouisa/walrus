@@ -2,6 +2,7 @@ import logging
 from typing import Dict, List, Literal, Optional, Union
 
 import torch
+from omegaconf import DictConfig, OmegaConf
 from the_well.data import WellDataset
 from the_well.data.augmentation import Augmentation
 from torch.utils.data import (
@@ -10,6 +11,7 @@ from torch.utils.data import (
     DistributedSampler,
     RandomSampler,
     Sampler,
+    SequentialSampler,
 )
 from torch.utils.data._utils.collate import default_collate
 
@@ -200,6 +202,9 @@ class MixedWellDataModule:
             ), (
                 f"Expected transform keys {transform.keys()} to be a subset of train, val, rollout_val, test, rollout_test."
             )
+
+        if isinstance(dataset_kws, DictConfig):
+            dataset_kws = OmegaConf.to_container(dataset_kws, resolve=True)
 
         if dataset_kws is not None:
             # If dataset_kws is not a dict, raise an error
@@ -458,8 +463,19 @@ class MixedWellDataModule:
                     drop_last=False,
                 )
             else:
+                # Keep full evaluation in dataset order. Analysis code and
+                # trajectory metadata expect batch j to correspond to
+                # files_paths[j]; randomizing here silently pairs trajectories
+                # with the wrong filename and absolute time grid.
+                base_sampler = (
+                    SequentialSampler(dataset)
+                    if full
+                    else RandomSampler(
+                        dataset, generator=torch.Generator().manual_seed(0)
+                    )
+                )
                 sampler = BatchSampler(
-                    RandomSampler(dataset, generator=torch.Generator().manual_seed(0)),
+                    base_sampler,
                     batch_size=batch_size,
                     drop_last=False,
                 )

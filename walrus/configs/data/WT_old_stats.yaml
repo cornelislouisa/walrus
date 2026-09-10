@@ -1,0 +1,24 @@
+mean:
+  velocity:
+  - -1.0946E-01
+  - -1.0151E-01
+mean_delta:
+  velocity:
+  - -2.0930E-03
+  - 1.5303E-03
+rms:
+  velocity:
+  - 2.5731E+00
+  - 2.2484E+00
+rms_delta:
+  velocity:
+  - 4.2477E-01
+  - 4.8962E-01
+std:
+  velocity:
+  - 2.5708E+00
+  - 2.2461E+00
+std_delta:
+  velocity:
+  - 4.2476E-01
+  - 4.8962E-01
